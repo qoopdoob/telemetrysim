@@ -1,6 +1,6 @@
 # TeleSim — Central Telemetry Station Simulator
  
-A cardiac monitor training simulator for Windows written in Go that reproduces the look and behavior of a hospital central telemetry station, specifically a Philips IntelliVue system. The program features a board of patient sectors with live ECG, pleth, respiration, arterial pressure and capnography waveforms, numerics, alarm messages and alarm tones. Every rhythm, rate, waveform detail and alarm is controllable, so it can be used for rhythm-recognition practice, alarm-response drills and teaching for medical professionals.
+A vibe-coded cardiac monitor training simulator for Windows written in Go that reproduces the look and behavior of a hospital central telemetry station, specifically a Philips IntelliVue system. The program features a board of patient sectors with live ECG, pleth, respiration, arterial pressure and capnography waveforms, numerics, alarm messages and alarm tones. Every rhythm, rate, waveform detail and alarm is controllable, so it can be used for rhythm-recognition practice, alarm-response drills and teaching for medical professionals.
  
 ---
  
