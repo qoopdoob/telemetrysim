@@ -3,7 +3,7 @@
 package main
 
 // Crash logging: Go runtime fatal errors and any panic inside a window
-// procedure are written to TelemetrySim-crash.log next to the .exe.
+// procedure are written to TeleSim-crash.log next to the .exe.
 
 import (
 	"fmt"
@@ -20,10 +20,10 @@ func initCrashLog() {
 	if exe, err := os.Executable(); err == nil {
 		dir = filepath.Dir(exe)
 	}
-	crashPath = filepath.Join(dir, "TelemetrySim-crash.log")
+	crashPath = filepath.Join(dir, "TeleSim-crash.log")
 	f, err := os.OpenFile(crashPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		crashPath = filepath.Join(os.TempDir(), "TelemetrySim-crash.log")
+		crashPath = filepath.Join(os.TempDir(), "TeleSim-crash.log")
 		if f, err = os.OpenFile(crashPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err != nil {
 			return
 		}

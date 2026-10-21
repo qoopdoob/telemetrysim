@@ -172,11 +172,12 @@ func main() {
 	registerClass("TeleSimMeas", syscallCallback(measProc), 0, 0)
 	registerClass("TeleSimReview", syscallCallback(reviewProc), 16, 0)
 	registerClass("TeleSimEventList", syscallCallback(eventListProc), 16, 0)
+	registerClass("TeleSimAbout", syscallCallback(aboutProc), 0, 0)
 
 	sw := int32(call(pGetSystemMetrics, 0))
 	sh := int32(call(pGetSystemMetrics, 1))
 	w, h := sw*85/100, sh*85/100
-	mainHwnd = call(pCreateWindowExW, 0, uintptr(unsafe.Pointer(wstr("TeleSimCentral"))), uintptr(unsafe.Pointer(wstr("Central Telemetry Station Simulator"))),
+	mainHwnd = call(pCreateWindowExW, 0, uintptr(unsafe.Pointer(wstr("TeleSimCentral"))), uintptr(unsafe.Pointer(wstr("TeleSim - Central Telemetry Station Simulator"))),
 		WS_OVERLAPPEDWINDOW, uintptr((sw-w)/2), uintptr((sh-h)/2), uintptr(w), uintptr(h), 0, 0, hInst, 0)
 	buildWavs()
 	buildMenu()
@@ -281,6 +282,8 @@ func buildMenu() {
 
 	help := call(pCreatePopupMenu)
 	call(pAppendMenuW, help, MF_STRING, idHelp, uintptr(unsafe.Pointer(wstr("How to use..."))))
+	call(pAppendMenuW, help, MF_SEPARATOR, 0, 0)
+	call(pAppendMenuW, help, MF_STRING, idAbout, uintptr(unsafe.Pointer(wstr("About TeleSim..."))))
 	call(pAppendMenuW, mainMenu, MF_POPUP, help, uintptr(unsafe.Pointer(wstr("&Help"))))
 	call(pSetMenu, mainHwnd, mainMenu)
 	updateChecks()
@@ -466,7 +469,7 @@ func silenceBed(i int) {
 	updateAlarmState()
 }
 
-const helpText = `Central Telemetry Station Simulator
+const helpText = `TeleSim - Central Telemetry Station Simulator
 
 PATIENT SECTORS
 - Hover over a patient to show its buttons (as at the Information Center):
@@ -722,8 +725,10 @@ func mainProc(hwnd, msg, wp, lp uintptr) uintptr {
 		switch {
 		case id == idExit:
 			call(pDestroyWindow, hwnd)
+		case id == idAbout:
+			openAbout()
 		case id == idHelp:
-			messageBox(hwnd, helpText, "How to use", 0x40)
+			messageBox(hwnd, helpText, "TeleSim - How to use", 0x40)
 		case id == idResetAll:
 			t := now()
 			for _, p := range patients {

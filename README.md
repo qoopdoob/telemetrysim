@@ -33,7 +33,7 @@ You control every patient's rhythm, rate, ectopy, conduction, vital signs and al
 
 ## 1. Quick start
 
-1. Copy `TelemetrySim.exe` to any folder on a 64-bit Windows 10 or 11 PC. Nothing needs to be installed.
+1. Copy `TeleSim.exe` to any folder on a 64-bit Windows 10 or 11 PC. Nothing needs to be installed.
 2. Run it. Windows SmartScreen may warn that the program is unsigned; choose **More info → Run anyway**.
 3. Every bed starts in **Standby**. To bring patients on:
    - fill the whole board at once from the **Patients** menu (for example *Simulate typical ER telemetry board*), or
@@ -425,7 +425,7 @@ The **Patients** menu fills the whole board:
 | **Alarms** | Silence all, alarm and arrhythmia limits, alarm text (Enhanced / Standard), alarm latching, HR High/Low as standard yellow, sound on/off, volume |
 | **Events** | Event Log |
 | **Quiz** | Rhythm Quiz (10 strips) |
-| **Help** | How to use |
+| **Help** | How to use, About TeleSim |
 
 ---
 
@@ -449,22 +449,22 @@ TeleSim is written in **Go** using only the standard library. The Windows interf
 It needs Go 1.21 or newer (it was developed with Go 1.24) and can be built on any OS:
 
 ```sh
-GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-H windowsgui -s -w" -o TelemetrySim.exe .
+GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-H windowsgui -s -w" -o TeleSim.exe .
 ```
 
 On Windows PowerShell:
 
 ```powershell
 $env:GOOS="windows"; $env:GOARCH="amd64"
-go build -trimpath -ldflags "-H windowsgui -s -w" -o TelemetrySim.exe .
+go build -trimpath -ldflags "-H windowsgui -s -w" -o TeleSim.exe .
 ```
 
 The program icon is already compiled into `rsrc_windows_amd64.syso`, so the commands above produce an .exe with its icon. To redraw or change it (needs Python with Pillow, and LLVM's `llvm-rc` and `llvm-cvtres`):
 
 ```sh
-python3 tools/mkicon.py TelemetrySim.ico
-cd tools && cp ../TelemetrySim.ico . && llvm-rc /fo app.res app.rc \
-  && llvm-cvtres /machine:x64 /out:../rsrc_windows_amd64.syso app.res && rm app.res TelemetrySim.ico
+python3 tools/mkicon.py TeleSim.ico
+cd tools && cp ../TeleSim.ico . && llvm-rc /fo app.res app.rc \
+  && llvm-cvtres /machine:x64 /out:../rsrc_windows_amd64.syso app.res && rm app.res TeleSim.ico
 ```
 
 On Linux or macOS, `go run .` does not open the GUI. It runs a preview tool that renders test strips of every rhythm to PNG files in `./preview`.
@@ -490,13 +490,16 @@ On Linux or macOS, `go run .` does not open the GUI. It runs a preview tool that
 | `quiz_windows.go` | Rhythm quiz window |
 | `odds_windows.go` | Scenario odds dialog |
 | `sound_windows.go` | Alarm sound playback and priority |
-| `crashlog_windows.go` | Writes `TelemetrySim-crash.log` next to the .exe if the program crashes |
+| `about_windows.go` | About window (Help → About TeleSim) |
+| `smiley.go` | Vector outlines of the About window's smiley face, traced from `tools/smiley.png` by `tools/tracesmiley.py` |
+| `crashlog_windows.go` | Writes `TeleSim-crash.log` next to the .exe if the program crashes |
 | `win32.go` | Minimal Win32 bindings and GDI helpers; loads the program icon |
-| `TelemetrySim.ico` | Program icon (16–256 px), drawn by `tools/mkicon.py` |
+| `TeleSim.ico` | Program icon (16–256 px), drawn by `tools/mkicon.py` |
 | `rsrc_windows_amd64.syso` | The icon compiled as a Windows resource; `go build` links it into the .exe automatically |
-| `tools/` | `mkicon.py` (draws the icon) and `app.rc` (resource script) |
+| `tools/` | `mkicon.py` (draws the icon), `app.rc` (resource script), `smiley.png` and `tracesmiley.py` (the smiley drawing and its tracer) |
 | `preview_other.go` | Non-Windows preview renderer |
 | `rate_test.go`, `soak_test.go` | Tests |
+| `LICENSE` | The GNU General Public License, version 3 |
 
 The engine files (`ecg.go`, `arrhythmia.go`, `vitals.go`, `scenarios.go`, `quiz.go`, `alarmsynth.go`) are platform-independent. Everything with the `_windows.go` suffix is the Win32 front end.
 
@@ -518,6 +521,14 @@ go test ./...
 - Alarm behaviour follows the published IntelliVue documentation, but TeleSim is an independent simulator. It is not affiliated with or endorsed by Philips.
 - Alarm tones approximate a real central station. They were synthesized from analysis of recordings, not copied.
 - Waveforms are synthetic models designed to look and behave realistically for teaching. They are not derived from patient data.
-- If the program ever crashes, send the `TelemetrySim-crash.log` file created next to the .exe.
+- If the program ever crashes, send the `TeleSim-crash.log` file created next to the .exe.
+
+---
+
+## License
+
+Vibe-coded by Jeffrey Olvesen.
+
+TeleSim is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 3 of the License. It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the [`LICENSE`](LICENSE) file for the full terms.
 
 **For education and training only. Not a medical device.**

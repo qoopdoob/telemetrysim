@@ -347,7 +347,7 @@ func getText(h uintptr) string {
 }
 
 // appIcon loads the program icon (resource 1, embedded from
-// TelemetrySim.ico via rsrc_windows_amd64.syso) at the large or small
+// TeleSim.ico via rsrc_windows_amd64.syso) at the large or small
 // system icon size, falling back to the stock application icon.
 func appIcon(small bool) uintptr {
 	cx, cy := call(pGetSystemMetrics, 11), call(pGetSystemMetrics, 12) // SM_CXICON, SM_CYICON
