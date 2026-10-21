@@ -35,8 +35,13 @@ func RandomConfig(r *rand.Rand, name string) Config {
 	if r.Float64() < 0.2 {
 		c.CO2On, c.EtCO2 = true, int(gauss(r, 38, 8, 15, 70))
 	}
-	// everything except Leads Off
+	// any rhythm; now and then a patient with the leads off, and a few whose
+	// electrodes come off intermittently
 	c.Rhythm = Rhythm(1 + r.Intn(int(RCount)-1))
+	if r.Float64() < 0.03 {
+		c.Rhythm = RLeadsOff
+	}
+	c.LeadsOffEp = c.Rhythm != RLeadsOff && r.Float64() < 0.08
 	info := Rhythms[c.Rhythm]
 	if c.Rhythm == RAflutter {
 		c.FlRatio = []int{FlAuto, Fl2to1, Fl3to1, Fl4to1, FlVariable}[r.Intn(5)]
@@ -53,11 +58,21 @@ func RandomConfig(r *rand.Rand, name string) Config {
 	}
 	if info.Ectopy && r.Float64() < 0.4 {
 		c.Ectopy = 1 + r.Intn(4)
-		if c.Ectopy >= EctPAC && !info.AtrialEctopy {
+		if (c.Ectopy == EctPAC || c.Ectopy == EctPJC) && !info.AtrialEctopy {
 			c.Ectopy = EctPVCUni
 		}
 		c.Pattern = r.Intn(len(PatternNames))
+		if (c.Ectopy == EctPAC || c.Ectopy == EctPJC) && c.Pattern == PatVTRuns {
+			c.Pattern = PatRuns
+		}
 		c.Freq = randIn(r, 2, 12)
+		if SinusNode(c.Rhythm) && r.Float64() < 0.25 { // PSVT episodes or sinus pauses
+			c.Ectopy, c.Pattern = EctPSVT, PatOccasional
+			c.Freq = randIn(r, 6, 30) // per hour
+			if r.Float64() < 0.5 {
+				c.Ectopy, c.Freq = EctSinusPause, randIn(r, 1, 4)
+			}
+		}
 	}
 	return c
 }
@@ -111,13 +126,14 @@ var UnitNames = []string{"ED", "Med-surg tele", "Step-down", "ICU"}
 // Patients > Scenario odds.
 type UnitOdds struct {
 	SpO2, NBP, ABP, CO2, Artifact float64
+	LeadsOff                      float64 // electrodes come off now and then
 }
 
 var Odds = [UnitCount]UnitOdds{
-	UnitED:       {SpO2: 75, NBP: 85, ABP: 1, CO2: 3, Artifact: 20},
-	UnitMedSurg:  {SpO2: 45, NBP: 0, ABP: 0, CO2: 2, Artifact: 28},
-	UnitStepdown: {SpO2: 90, NBP: 90, ABP: 6, CO2: 5, Artifact: 15},
-	UnitICU:      {SpO2: 98, NBP: 75, ABP: 45, CO2: 30, Artifact: 12},
+	UnitED:       {SpO2: 75, NBP: 85, ABP: 1, CO2: 1, Artifact: 20, LeadsOff: 8},
+	UnitMedSurg:  {SpO2: 0, NBP: 0, ABP: 0, CO2: 0, Artifact: 28, LeadsOff: 15},
+	UnitStepdown: {SpO2: 90, NBP: 90, ABP: 6, CO2: 5, Artifact: 15, LeadsOff: 8},
+	UnitICU:      {SpO2: 98, NBP: 75, ABP: 45, CO2: 30, Artifact: 12, LeadsOff: 4},
 }
 
 type unitProfile struct {
@@ -132,15 +148,17 @@ type unitProfile struct {
 	leadsOffBias float64 // extra chance of leads off
 }
 
+// Med-surg tele: mostly stable rhythms; unstable ones (AF with RVR, 2:1
+// flutter, SVT, Mobitz II, complete heart block) are rare.
 var medSurgMix = []erEntry{
-	{38, RSinus, 60, 100, 0}, {8, RSinus, 101, 125, 0}, {9, RSinus, 45, 59, 0},
+	{40, RSinus, 60, 100, 0}, {7, RSinus, 101, 115, 0}, {9, RSinus, 50, 59, 0},
 	{2, RSinusArrhythmia, 55, 85, 0},
-	{15, RAfib, 60, 100, 0}, {3, RAfib, 105, 140, 0},
-	{1, RAflutter, 280, 320, Fl4to1}, {0.7, RAflutter, 280, 320, Fl2to1}, {0.3, RAflutter, 280, 320, FlVariable},
+	{16, RAfib, 60, 100, 0}, {0.8, RAfib, 105, 125, 0},
+	{1, RAflutter, 280, 320, Fl4to1}, {0.15, RAflutter, 280, 320, Fl2to1}, {0.2, RAflutter, 280, 320, FlVariable},
 	{6, RFirstDegree, 50, 85, 0},
 	{3, RPaced, 60, 80, 0}, {3.5, RAVPaced, 60, 80, 0}, {0.5, RAPaced, 60, 80, 0},
-	{0.3, RSVT, 150, 190, 0}, {0.6, RJunctional, 40, 60, 0},
-	{0.7, RMobitzI, 50, 70, 0}, {0.3, RMobitzII, 40, 55, 0}, {0.2, RThirdDegree, 32, 45, 0},
+	{0.05, RSVT, 150, 180, 0}, {0.4, RJunctional, 45, 60, 0},
+	{0.5, RMobitzI, 50, 70, 0}, {0.06, RMobitzII, 40, 55, 0}, {0.03, RThirdDegree, 35, 45, 0},
 }
 
 var stepdownMix = []erEntry{
@@ -169,7 +187,7 @@ var icuMix = []erEntry{
 }
 
 var unitProfiles = [UnitCount]unitProfile{
-	UnitED:       {erMix, []int{10, 15, 15, 15, 30}, 132, 20, 12, 22, 0.12, 0.07, 1.0, 0},
+	UnitED:       {erMix, []int{10, 15, 15, 15, 30}, 132, 20, 12, 22, 0.12, 0.07, 1.0, 0.02},
 	UnitMedSurg:  {medSurgMix, []int{30, 60, 240, 240}, 128, 18, 14, 22, 0.08, 0.05, 1.3, 0.06},
 	UnitStepdown: {stepdownMix, []int{60, 60, 60, 60, 30, 15, 240}, 126, 24, 14, 26, 0.18, 0.10, 1.2, 0.02},
 	UnitICU:      {icuMix, []int{15, 15, 30, 60, 60, 60, 5}, 118, 26, 12, 28, 0.22, 0.14, 1.3, 0.01},
@@ -216,13 +234,21 @@ func UnitConfig(r *rand.Rand, name string, unit int) Config {
 		default:
 			c.SpO2 = randIn(r, 94, 100)
 		}
-	} else if r.Float64() < 0.05 {
+	} else if od.SpO2 > 0 && r.Float64() < 0.05 { // (units without pulse oximetry never show it)
 		c.SpO2On = SpO2SensorOff
 	}
 	if Rhythms[e.rhythm].UsesRate {
 		c.Rate = randIn(r, e.lo, e.hi)
 	}
 	c.Tune = naturalTune(r, c)
+	// a wide QRS on a conducted rhythm is usually a bundle branch block
+	if c.Tune.QRSms >= 120 && UsesConduction(c.Rhythm) && r.Float64() < 0.8 {
+		c.Conduction = CondRBBB
+		if r.Float64() < 0.4 {
+			c.Conduction = CondLBBB
+		}
+		c.Tune.QRSms = 0 // the block sets the QRS width
+	}
 	// blood pressure
 	c.NBPSys = int(gauss(r, pr.sysMean, pr.sysSD, 80, 210))
 	c.NBPDia = int(gauss(r, float64(c.NBPSys)*0.58, 8, 40, 115))
@@ -238,6 +264,8 @@ func UnitConfig(r *rand.Rand, name string, unit int) Config {
 		c.CO2On = true
 		c.EtCO2 = int(gauss(r, 38, 5, 25, 55))
 	}
+	// a few patients' electrodes come off now and then
+	c.LeadsOffEp = e.rhythm != RLeadsOff && chance(od.LeadsOff)
 	// artifact, mostly mild/moderate, in proportions typical of telemetry
 	if e.rhythm != RLeadsOff && chance(od.Artifact) {
 		c.Artifact = []int{ArtTremor, ArtTremor, ArtTremor, ArtWander, ArtWander, ArtWander,
@@ -260,10 +288,14 @@ func UnitConfig(r *rand.Rand, name string, unit int) Config {
 		c.Ectopy, c.Pattern, c.Freq = EctPAC, PatOccasional, randIn(r, 2, 6)
 	case y < 0.25:
 		c.Ectopy, c.Pattern = EctPVCUni, []int{PatBigeminy, PatTrigeminy, PatQuadrigeminy}[r.Intn(3)]
-	case y < 0.28:
+	case y < 0.28 && unit != UnitMedSurg: // multifocal PVCs / couplets: not on med-surg
 		c.Ectopy, c.Pattern, c.Freq = EctPVCMulti, PatOccasional, randIn(r, 2, 5)
-	case y < 0.30:
+	case y < 0.30 && unit != UnitMedSurg:
 		c.Ectopy, c.Pattern, c.Freq = EctPVCUni, PatCouplets, randIn(r, 1, 2)
+	case y < 0.315 && SinusNode(c.Rhythm): // sinus pauses (sick sinus), mostly older patients
+		c.Ectopy, c.Pattern, c.Freq = EctSinusPause, PatOccasional, 1
+	case y < 0.322 && SinusNode(c.Rhythm) && unit != UnitMedSurg: // PSVT, a few episodes an hour
+		c.Ectopy, c.Pattern, c.Freq = EctPSVT, PatOccasional, randIn(r, 2, 6)
 	}
 	return c
 }
@@ -291,7 +323,7 @@ func naturalTune(r *rand.Rand, c Config) Tune {
 		t.PRms = int(gauss(r, 175, 15, 150, 210))
 	}
 
-	// QRS width: ~10% have a bundle branch block / IVCD
+	// QRS width: ~10% wide (mostly turned into a bundle branch block by the caller)
 	if r.Float64() < 0.10 {
 		t.QRSms = int(gauss(r, 132, 10, 120, 160))
 	} else {

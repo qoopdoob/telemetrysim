@@ -24,6 +24,9 @@ var (
 	pShowWindow         = user32.NewProc("ShowWindow")
 	pUpdateWindow       = user32.NewProc("UpdateWindow")
 	pSetTimer           = user32.NewProc("SetTimer")
+	pSetWindowPos       = user32.NewProc("SetWindowPos")
+	pSetCapture         = user32.NewProc("SetCapture")
+	pReleaseCapture     = user32.NewProc("ReleaseCapture")
 	pInvalidateRect     = user32.NewProc("InvalidateRect")
 	pBeginPaint         = user32.NewProc("BeginPaint")
 	pEndPaint           = user32.NewProc("EndPaint")
@@ -50,6 +53,7 @@ var (
 	pDrawTextW          = user32.NewProc("DrawTextW")
 	pSetProcessDPIAware = user32.NewProc("SetProcessDPIAware")
 	pGetSystemMetrics   = user32.NewProc("GetSystemMetrics")
+	pLoadImageW         = user32.NewProc("LoadImageW")
 	pSetForegroundWin   = user32.NewProc("SetForegroundWindow")
 	pGetDC              = user32.NewProc("GetDC")
 	pReleaseDC          = user32.NewProc("ReleaseDC")
@@ -103,6 +107,8 @@ const (
 	WM_LBUTTONDOWN   = 0x0201
 	WM_LBUTTONDBLCLK = 0x0203
 	WM_RBUTTONDOWN   = 0x0204
+	wmLButtonUp      = 0x0202
+	wmRButtonUp      = 0x0205
 
 	WS_OVERLAPPEDWINDOW = 0x00CF0000
 	WS_VISIBLE          = 0x10000000
@@ -340,13 +346,27 @@ func getText(h uintptr) string {
 	return syscall.UTF16ToString(b[:])
 }
 
+// appIcon loads the program icon (resource 1, embedded from
+// TelemetrySim.ico via rsrc_windows_amd64.syso) at the large or small
+// system icon size, falling back to the stock application icon.
+func appIcon(small bool) uintptr {
+	cx, cy := call(pGetSystemMetrics, 11), call(pGetSystemMetrics, 12) // SM_CXICON, SM_CYICON
+	if small {
+		cx, cy = call(pGetSystemMetrics, 49), call(pGetSystemMetrics, 50) // SM_CXSMICON, SM_CYSMICON
+	}
+	if h := call(pLoadImageW, hInst, 1, 1, cx, cy, 0x8000); h != 0 { // IMAGE_ICON, LR_SHARED
+		return h
+	}
+	return call(pLoadIconW, 0, IDI_APP)
+}
+
 func registerClass(name string, proc uintptr, bg uintptr, style uint32) {
 	wc := WNDCLASSEXW{
 		Style:      style,
 		WndProc:    proc,
 		Instance:   hInst,
-		Icon:       call(pLoadIconW, 0, IDI_APP),
-		IconSm:     call(pLoadIconW, 0, IDI_APP),
+		Icon:       appIcon(false),
+		IconSm:     appIcon(true),
 		Cursor:     call(pLoadCursorW, 0, IDC_ARROW),
 		Background: bg,
 		ClassName:  wstr(name),

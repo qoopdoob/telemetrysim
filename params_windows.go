@@ -74,18 +74,19 @@ func drawBP(dc uintptr, r RECT, label, sub, sysdia, mean string, c uint32) {
 			text(dc, sub, sx, r.Top+S(2), r.Right-S(2), r.Top+S(2)+lab*2, c, sf, DT_SINGLELINE|DT_END_ELLIPSIS)
 		}
 	}
-	big := int32(math.Min(nh*0.42, nw*0.28))
-	bf := font(big, false, "Arial")
-	for big > S(10) && textWidth(dc, sysdia, bf) > int32(nw*0.92) { // shrink to fit
-		big = big * 9 / 10
-		bf = font(big, false, "Arial")
+	// "sys/dia (mean)" on one line, e.g. "119/80 (95)"
+	line := sysdia
+	if mean != "" {
+		line += " " + mean
 	}
 	top := r.Top + lab + S(2) + extra
-	bh := int32(float64(r.Bottom-top) * 0.62)
-	text(dc, sysdia, r.Left, top, r.Right-S(6), top+bh, c, bf, DT_SINGLELINE|DT_VCENTER|DT_RIGHT)
-	if mean != "" {
-		text(dc, mean, r.Left, top+bh, r.Right-S(6), r.Bottom, c, font(int32(float64(big)*0.62), false, "Arial"), DT_SINGLELINE|DT_VCENTER|DT_RIGHT)
+	big := int32(float64(r.Bottom-top) * 0.70) // then shrink to fit the width
+	bf := font(big, false, "Arial")
+	for big > S(10) && textWidth(dc, line, bf) > int32(nw*0.95) { // shrink to fit
+		big = big * 19 / 20
+		bf = font(big, false, "Arial")
 	}
+	text(dc, line, r.Left, top, r.Right-S(6), r.Bottom, c, bf, DT_SINGLELINE|DT_VCENTER|DT_RIGHT)
 }
 
 // nbpTimeLabel is the wall-clock time of the last NBP reading.
@@ -96,6 +97,8 @@ func nbpTimeLabel(p *Patient) string {
 
 // drawParamNumeric draws one numeric box of the given kind.
 func drawParamNumeric(dc uintptr, r RECT, kind int, p *Patient) {
+	curHits = append(curHits, mhit{r, measOfKind(kind)})
+	defer alarmsOffMark(dc, r, kind, p)
 	lm := p.lim()
 	it := strconv.Itoa
 	q := func(ok bool, v int) string {
@@ -138,7 +141,7 @@ func drawParamNumeric(dc uintptr, r RECT, kind int, p *Patient) {
 		}
 	case kPVCnum:
 		pvc := "-?-"
-		if p.Cfg.Rhythm != RLeadsOff && p.HRValid {
+		if !p.LeadsOff() && p.HRValid {
 			pvc = it(p.PVCMin)
 		}
 		drawNumeric(dc, r, "PVC/min", pvc, cGreen, "10", "")
@@ -211,4 +214,20 @@ func drawCO2(dc uintptr, p *Patient, r, tr RECT) {
 	sf := font(S(10), false, "Segoe UI")
 	text(dc, strconv.Itoa(int(top)), tr.Left+S(2), int32(y0-top*k)-S(13), tr.Left+S(40), int32(y0-top*k), cYellow, sf, DT_SINGLELINE)
 	sweepTrace(dc, p, tr, func(i int64) float64 { return y0 - float64(p.CO2At(i))*k }, cYellow, respSpeed())
+}
+
+// alarmsOffMark draws a small crossed-out alarm symbol at the top right of a
+// numeric whose measurement has its alarms switched off.
+func alarmsOffMark(dc uintptr, r RECT, kind int, p *Patient) {
+	m := measOfKind(kind)
+	if m == MeasArrhy {
+		m = MeasECG
+	}
+	if p.MeasOff&(1<<uint(m)) == 0 {
+		return
+	}
+	x, y, d := r.Right-S(14), r.Top+S(9), S(5)
+	pn := pen(rgb(255, 60, 60), S(2))
+	line(dc, x-d, y-d, x+d, y+d, pn)
+	line(dc, x+d, y-d, x-d, y+d, pn)
 }

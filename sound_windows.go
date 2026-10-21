@@ -75,7 +75,7 @@ func alarmSoundLevel(lvl int) int {
 	switch lvl {
 	case AlarmPanic, 3: // panic alarms use the red alarm tone
 		return sndRed
-	case 2:
+	case 2, 1: // short yellow arrhythmia alarms use the yellow tone (briefly)
 		return sndYellow
 	case 4:
 		return sndInop

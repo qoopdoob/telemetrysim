@@ -57,6 +57,12 @@ type vitals struct {
 
 	ABPSys, ABPDia, ABPMap int
 	ABPValid               bool
+	ABPPulsatile           bool
+
+	// perfusion: 1 = the patient's set pressures, falling toward 0 while
+	// there is no cardiac output, recovering when pulses return
+	perf, perfTarget float64
+	ampAvg           float64 // mean pulse strength over the last few seconds
 
 	EtCO2Disp, AwRR int
 	CO2Valid        bool
@@ -69,6 +75,55 @@ type vitals struct {
 	CuffP                  int
 	NBPFailed              bool
 	lastEt                 float64 // CO2 at the end of the previous expiration
+	nbpN, nbpPulsing       int     // seconds of deflation / with pulses
+	nbpPerfSum, nbpAmpSum  float64
+}
+
+// pressure the arterial system settles to with no cardiac output (mmHg)
+const arrestFloor = 16.0
+
+// updatePerfTarget derives the perfusion target from recent pulses (1/s):
+// normal beats give the set pressures; weak pulses (e.g. V-tach with a pulse)
+// lower them.
+func (p *Patient) updatePerfTarget(now float64) {
+	n, s := 0, 0.0
+	for _, q := range p.pulses {
+		if q.t <= now && q.t > now-6 {
+			n++
+			s += q.amp
+		}
+	}
+	if n == 0 {
+		p.ampAvg = 0
+		return
+	}
+	p.ampAvg = s / float64(n)
+	p.perfTarget = 1
+	if p.ampAvg < 0.85 {
+		p.perfTarget = 0.5 + 0.5*p.ampAvg/0.85
+	}
+}
+
+// updatePerf advances the perfusion state by one sample. With no pulses
+// (asystole, VF, pulseless VT) it decays; when pulses return it recovers
+// over several seconds, so pressures climb back gradually.
+func (p *Patient) updatePerf(t float64) {
+	last := math.Inf(-1)
+	for i := len(p.pulses) - 1; i >= 0; i-- {
+		if p.pulses[i].t <= t {
+			last = p.pulses[i].t
+			break
+		}
+	}
+	target := p.perfTarget
+	if t-last > math.Max(2.0, 2.2*60/p.ventRate()) {
+		target = 0
+	}
+	tau := 8.0
+	if target < p.perf {
+		tau = 20
+	}
+	p.perf += (target - p.perf) / (FS * tau)
 }
 
 func (p *Patient) ABPAt(k int64) float32 { return p.abuf[((k%bufLen)+bufLen)%bufLen] }
@@ -76,7 +131,9 @@ func (p *Patient) CO2At(k int64) float32 { return p.cbuf[((k%bufLen)+bufLen)%buf
 
 // abpValue: arterial pressure (mmHg). Each perfusing beat gives a pressure
 // pulse (sharp upstroke, dicrotic notch, diastolic run-off) scaled by the
-// beat's filling (PVCs give weak pulses); with no beats it falls away.
+// beat's filling (PVCs give weak pulses). With no cardiac output the
+// pulsations stop and the pressure runs off toward ~16 mmHg; after a return
+// of pulses it recovers gradually (perf).
 func (p *Patient) abpValue(t float64) float64 {
 	if !p.Cfg.ABPOn {
 		return 0
@@ -85,6 +142,8 @@ func (p *Patient) abpValue(t float64) float64 {
 	if sys <= dia {
 		sys = dia + 10
 	}
+	sys = arrestFloor + (sys-arrestFloor)*p.perf
+	dia = arrestFloor + (dia-arrestFloor)*p.perf
 	last := math.Inf(-1)
 	pulse := 0.0
 	// diastolic run-off continues until the next beat; offset it so the
@@ -109,14 +168,19 @@ func (p *Patient) abpValue(t float64) float64 {
 		}
 	}
 	base := dia
-	if gap := t - last; gap > 60/p.ventRate()*1.3 { // no beat: pressure falls away
-		base = 12 + (dia-12)*math.Exp(-(gap-60/p.ventRate()*1.3)/1.2)
-		pulse *= math.Exp(-(gap - 60/p.ventRate()*1.3) / 0.6)
+	if gap := t - last; gap > 60/p.ventRate()*1.3 { // no beat: pressure runs off
+		x := gap - 60/p.ventRate()*1.3
+		base = arrestFloor + (dia-arrestFloor)*math.Exp(-x/3.0)
+		pulse *= math.Exp(-x / 0.6)
 	}
 	if math.IsInf(last, -1) {
-		base = 12
+		base = arrestFloor
 	}
-	return base + (sys-dia)*pulse + 0.4*p.rng.NormFloat64()
+	v := base + (sys-dia)*pulse
+	if p.Cfg.Rhythm == RVFibCoarse { // fibrillating ventricles: a faint ripple, no pulse
+		v += 0.8 * math.Sin(2*math.Pi*4.6*t+p.ph[2])
+	}
+	return v + 0.4*p.rng.NormFloat64()
 }
 
 // abpShape is one arterial pressure pulse (0 = diastolic, ~1 = systolic):
@@ -138,7 +202,8 @@ func (p *Patient) co2Value(t float64) float64 {
 	if p.Cfg.Apnea || p.breathPer <= 0 {
 		return 0.3 * math.Abs(p.rng.NormFloat64())
 	}
-	et := float64(p.Cfg.EtCO2) * p.breathEt
+	// no pulmonary blood flow -> little CO2 delivered to the lungs
+	et := float64(p.Cfg.EtCO2) * p.breathEt * (0.15 + 0.85*p.perf)
 	x := (t - p.breathStart) / p.breathPer
 	f := p.breathF // follows this breath's inspiratory time
 	var v float64
@@ -176,6 +241,7 @@ func (p *Patient) StartNBP(now float64) {
 		return
 	}
 	p.NBPMeasuring, p.nbpStart = true, now
+	p.nbpN, p.nbpPulsing, p.nbpPerfSum, p.nbpAmpSum = 0, 0, 0, 0
 }
 
 // updateNBP runs the cuff cycle and auto-interval scheduling (called 1/s).
@@ -196,27 +262,34 @@ func (p *Patient) updateNBP(now float64) {
 	switch {
 	case el < 6: // inflate
 		p.CuffP = int(target * el / 6)
-	case el < nbpCycle: // step deflation
+	case el < nbpCycle: // step deflation: the cuff senses arterial pulsations
 		p.CuffP = int(target - (target-float64(c.NBPDia-15))*(el-6)/(nbpCycle-6))
+		p.nbpN++
+		p.nbpPerfSum += p.perf
+		for _, q := range p.pulses {
+			if q.t > now-2 && q.t <= now {
+				p.nbpPulsing++
+				p.nbpAmpSum += p.ampAvg
+				break
+			}
+		}
 	default: // done
 		p.NBPMeasuring, p.CuffP = false, 0
 		p.NBPAt = now
 		iv := float64(nbpMinutes(c)) * 60
 		p.nbpNext = now + iv
-		// a reading needs pulsatile flow
-		pulsing := false
-		for _, q := range p.pulses {
-			if q.t > now-8 && q.t <= now {
-				pulsing = true
-			}
-		}
-		if !pulsing {
+		// a reading needs pulsatile flow for most of the deflation
+		if p.nbpN == 0 || p.nbpPulsing*2 < p.nbpN {
 			p.NBPFailed, p.NBPValid = true, false
 			return
 		}
+		pf := p.nbpPerfSum / float64(p.nbpN)
+		amp := clamp(p.nbpAmpSum/float64(p.nbpPulsing), 0.3, 1)
+		dia := arrestFloor + (float64(c.NBPDia)-arrestFloor)*pf
+		sys := dia + (arrestFloor+(float64(c.NBPSys)-arrestFloor)*pf-dia)*amp
 		p.NBPFailed, p.NBPValid = false, true
-		p.NBPSys = c.NBPSys + int(math.Round(4*p.rng.NormFloat64()))
-		p.NBPDia = c.NBPDia + int(math.Round(3*p.rng.NormFloat64()))
+		p.NBPSys = int(math.Round(sys + 4*p.rng.NormFloat64()))
+		p.NBPDia = int(math.Round(dia + 3*p.rng.NormFloat64()))
 		if p.NBPDia >= p.NBPSys-10 {
 			p.NBPDia = p.NBPSys - 10
 		}
@@ -237,21 +310,19 @@ func clampInt(v, lo, hi int) int {
 // measureVitals derives ABP and EtCO2 numerics from their waveforms (1/s).
 func (p *Patient) measureVitals(now float64) {
 	last := p.Last()
-	p.ABPValid = false
-	if p.Cfg.ABPOn {
+	p.ABPValid, p.ABPPulsatile = false, false
+	if p.Cfg.ABPOn && last > int64(4*FS) {
 		n := int64(4 * FS)
 		mx, mn, sum := -1e9, 1e9, 0.0
 		for k := last - n; k <= last; k++ {
 			v := float64(p.ABPAt(k))
 			mx, mn, sum = math.Max(mx, v), math.Min(mn, v), sum+v
 		}
-		if mx-mn > 8 { // pulsatile
-			p.ABPValid = true
-			p.ABPSys, p.ABPDia = int(math.Round(mx)), int(math.Round(mn))
-			p.ABPMap = int(math.Round(sum / float64(n+1)))
-		} else {
-			p.ABPMap = int(math.Round(sum / float64(n+1)))
-		}
+		// the numerics follow the wave, pulsatile or not (e.g. 18/15 (16) in arrest)
+		p.ABPValid = true
+		p.ABPPulsatile = mx-mn >= 3 // non-pulsatile: amplitude below 3 mmHg
+		p.ABPSys, p.ABPDia = int(math.Round(mx)), int(math.Round(mn))
+		p.ABPMap = int(math.Round(sum / float64(n+1)))
 	}
 	p.CO2Valid = false
 	if p.Cfg.CO2On {
@@ -285,7 +356,7 @@ func (p *Patient) measureVitals(now float64) {
 
 // stMeasurable reports whether ST/QT can be measured on the current rhythm.
 func (p *Patient) stMeasurable() bool {
-	if p.Cfg.CardiacOff || !p.HRValid || p.HR == 0 {
+	if p.Cfg.CardiacOff || !p.HRValid || p.HR == 0 || p.LeadsOff() {
 		return false
 	}
 	switch p.Cfg.Rhythm {

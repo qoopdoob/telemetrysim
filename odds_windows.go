@@ -15,15 +15,15 @@ const ctlOddsDefaults = 5
 
 var (
 	oddsHwnd  uintptr
-	oddsEdits [5][UnitCount]uintptr
+	oddsEdits [6][UnitCount]uintptr
 )
 
-var oddsRows = []string{"SpO₂ monitored", "NBP on auto cycle", "Arterial line (ABP)", "Capnography (EtCO₂)", "Artifact"}
+var oddsRows = []string{"SpO₂ monitored", "NBP on auto cycle", "Arterial line (ABP)", "Capnography (EtCO₂)", "Artifact", "Leads come off now & then"}
 
 var defaultOdds = Odds // captured at start-up
 
 func oddsField(o *UnitOdds, row int) *float64 {
-	return []*float64{&o.SpO2, &o.NBP, &o.ABP, &o.CO2, &o.Artifact}[row]
+	return []*float64{&o.SpO2, &o.NBP, &o.ABP, &o.CO2, &o.Artifact, &o.LeadsOff}[row]
 }
 
 func openOdds() {
@@ -35,7 +35,7 @@ func openOdds() {
 		return
 	}
 	uiFont = font(S(15), false, "Segoe UI")
-	w, h := S(670), S(330)
+	w, h := S(670), S(366)
 	var mr RECT
 	call(pGetWindowRect, mainHwnd, uintptr(unsafe.Pointer(&mr)))
 	x := mr.Left + (mr.Right-mr.Left-w)/2
@@ -56,8 +56,8 @@ func openOdds() {
 			ctl("STATIC", "%", 0, cx(u)+S(56), yy+S(3), S(20), S(22), 0)
 		}
 	}
-	ctl("STATIC", "Used by Patients > Simulate ... presets (rhythm mixes are fixed per unit).", 0, S(16), S(44)+S(36)*5+S(4), S(630), S(22), 0)
-	by := S(44) + S(36)*5 + S(36)
+	ctl("STATIC", "Used by Patients > Simulate ... presets (rhythm mixes are fixed per unit).", 0, S(16), S(44)+S(36)*6+S(4), S(630), S(22), 0)
+	by := S(44) + S(36)*6 + S(36)
 	ctl("BUTTON", "Defaults", WS_TABSTOP, S(16), by, S(100), S(30), ctlOddsDefaults)
 	ctl("BUTTON", "OK", WS_TABSTOP|BS_DEFPUSHBUTTON, w-S(230), by, S(90), S(30), 1)
 	ctl("BUTTON", "Cancel", WS_TABSTOP, w-S(130), by, S(90), S(30), 2)

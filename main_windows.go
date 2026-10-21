@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 )
@@ -31,32 +32,60 @@ var (
 	sectors    []sectorGeom
 	strips     = map[uintptr]*Strip{}
 	standby    [maxBeds]bool
-	silenced   [maxBeds]string // alarm text that has been silenced per bed
-	colsSet    = 3             // 0 = auto
-	silenceAll RECT            // top-bar "Silence All" button
+	acks       [maxBeds]ackState // acknowledged (silenced) alarm per bed
+	colsSet    = 3               // 0 = auto
+	silenceAll RECT              // top-bar "Silence All" button
 	anyAudible bool
 )
 
 type sectorGeom struct {
-	bed  int
+	bed   int
+	rc    RECT
+	lead  RECT
+	nbp   RECT   // clickable NBP title (interval menu)
+	btns  []hbtn // hover buttons (only while the mouse is over the sector)
+	hits  []mhit // waves and numerics: click to open that measurement's setup
+	alarm RECT   // the alarm message box (double-click: alarm strip)
+}
+
+// mhit is a clickable wave or numeric area.
+type mhit struct {
 	rc   RECT
-	lead RECT
-	nbp  RECT   // clickable NBP title (interval menu)
-	btns []hbtn // hover buttons (only while the mouse is over the sector)
+	meas int
+}
+
+// curHits collects the clickable areas while a sector is being drawn.
+var curHits []mhit
+
+// pendingClick is a single click on a wave/numeric, acted on once it is
+// clear it is not the first half of a double-click (which silences).
+var pendingClick struct {
+	on        bool
+	bed, meas int
+	x, y      int32
+	at        float64
 }
 
 type Strip struct {
-	data  []float32
-	bed   int
-	name  string
-	when  string
-	hr    string
-	alarm string
-	lvl   int
-	spo2  string
-	lead  string
-	paces []float64 // seconds from start of strip
-	buf   backBuf
+	data    []float32
+	bed     int
+	name    string
+	when    string
+	hr      string
+	alarm   string
+	lvl     int
+	spo2    string
+	lead    string
+	paces   []float64 // seconds from start of strip
+	buf     backBuf
+	status  string // rhythm / ectopic status when recorded
+	ev      *Event // the saved event this strip shows (nil = not saved)
+	cal     calipers
+	panel   stripPanel
+	at      time.Time  // alarm onset (alarm strips) / recording time
+	isAlarm bool       // strip of the rhythm that triggered an alarm
+	onset   float64    // alarm onset, seconds from the strip start (0 = none)
+	quiz    *quizState // rhythm quiz strip
 }
 
 func now() float64      { return 100 + time.Since(t0).Seconds() }
@@ -85,6 +114,11 @@ const (
 	idSound     = 310
 	idFPS       = 311
 	idRhyLbl    = 312
+	idNumAlarm  = 313
+	idLatchBase = 340 // +0..5
+	idHRStd     = 314
+	idEvents    = 315
+	idQuiz      = 316
 	idVolBase   = 320 // +0..2
 	idColsBase  = 400 // +0 auto, +1..4
 	idSpeedBase = 600 // +0..2
@@ -93,6 +127,8 @@ const (
 var sweepSpeeds = []float64{12.5, 25, 50}
 
 var (
+	latchMenu  uintptr
+	measTick   int
 	lowerSince float64 // when the board's alarm level first dropped
 	forceSound bool    // apply the next sound change immediately
 )
@@ -133,6 +169,9 @@ func main() {
 	registerClass("TeleSimLimits", syscallCallback(limitsProc), 16, 0)
 	registerClass("TeleSimTune", syscallCallback(tuneProc), 16, 0)
 	registerClass("TeleSimOdds", syscallCallback(oddsProc), 16, 0)
+	registerClass("TeleSimMeas", syscallCallback(measProc), 0, 0)
+	registerClass("TeleSimReview", syscallCallback(reviewProc), 16, 0)
+	registerClass("TeleSimEventList", syscallCallback(eventListProc), 16, 0)
 
 	sw := int32(call(pGetSystemMetrics, 0))
 	sh := int32(call(pGetSystemMetrics, 1))
@@ -218,13 +257,27 @@ func buildMenu() {
 
 	alarmMenu = call(pCreatePopupMenu)
 	call(pAppendMenuW, alarmMenu, MF_STRING, idSilAll, uintptr(unsafe.Pointer(wstr("Silence all alarms"))))
-	call(pAppendMenuW, alarmMenu, MF_STRING, idLimits, uintptr(unsafe.Pointer(wstr("Alarm limits (incl. PANIC limits)..."))))
+	call(pAppendMenuW, alarmMenu, MF_STRING, idLimits, uintptr(unsafe.Pointer(wstr("Alarm and arrhythmia limits..."))))
+	call(pAppendMenuW, alarmMenu, MF_STRING, idNumAlarm, uintptr(unsafe.Pointer(wstr("Alarm text: Enhanced (value and limit, e.g. ** SpO2 88<90)"))))
+	latchMenu = call(pCreatePopupMenu)
+	lname := []string{"Off", "Red Only", "Red&Yellow"}
+	for i, c := range LatchCombos {
+		call(pAppendMenuW, latchMenu, MF_STRING, uintptr(idLatchBase+i), uintptr(unsafe.Pointer(wstr("Visual: "+lname[c[0]]+"   Audible: "+lname[c[1]]))))
+	}
+	call(pAppendMenuW, alarmMenu, MF_POPUP, latchMenu, uintptr(unsafe.Pointer(wstr("Alarm latching"))))
+	call(pAppendMenuW, alarmMenu, MF_STRING, idHRStd, uintptr(unsafe.Pointer(wstr("HR High/Low as standard yellow (** instead of short yellow *)"))))
 	call(pAppendMenuW, alarmMenu, MF_SEPARATOR, 0, 0)
 	call(pAppendMenuW, alarmMenu, MF_STRING, idSound, uintptr(unsafe.Pointer(wstr("Alarm sounds on"))))
 	for i, n := range []string{"Volume: Low", "Volume: Medium", "Volume: High"} {
 		call(pAppendMenuW, alarmMenu, MF_STRING, uintptr(idVolBase+i), uintptr(unsafe.Pointer(wstr(n))))
 	}
 	call(pAppendMenuW, mainMenu, MF_POPUP, alarmMenu, uintptr(unsafe.Pointer(wstr("&Alarms"))))
+	evMenu := call(pCreatePopupMenu)
+	call(pAppendMenuW, evMenu, MF_STRING, idEvents, uintptr(unsafe.Pointer(wstr("Event Log..."))))
+	call(pAppendMenuW, mainMenu, MF_POPUP, evMenu, uintptr(unsafe.Pointer(wstr("&Events"))))
+	quizMenu := call(pCreatePopupMenu)
+	call(pAppendMenuW, quizMenu, MF_STRING, idQuiz, uintptr(unsafe.Pointer(wstr("Rhythm Quiz (10 strips)..."))))
+	call(pAppendMenuW, mainMenu, MF_POPUP, quizMenu, uintptr(unsafe.Pointer(wstr("&Quiz"))))
 
 	help := call(pCreatePopupMenu)
 	call(pAppendMenuW, help, MF_STRING, idHelp, uintptr(unsafe.Pointer(wstr("How to use..."))))
@@ -275,6 +328,23 @@ func updateChecks() {
 		f = MF_CHECKED
 	}
 	call(pCheckMenuItem, alarmMenu, idSound, f)
+	f = 0
+	if AlarmNumeric {
+		f = MF_CHECKED
+	}
+	call(pCheckMenuItem, alarmMenu, idNumAlarm, f)
+	f = 0
+	if HRStandardYellow {
+		f = MF_CHECKED
+	}
+	call(pCheckMenuItem, alarmMenu, idHRStd, f)
+	for i, c := range LatchCombos {
+		f := uintptr(0)
+		if c[0] == VisualLatch && c[1] == AudibleLatch {
+			f = MF_CHECKED
+		}
+		call(pCheckMenuItem, latchMenu, uintptr(idLatchBase+i), f)
+	}
 	for i := 0; i < 3; i++ {
 		f := uintptr(0)
 		if i == volumeIdx {
@@ -291,14 +361,33 @@ func updateAlarmState() {
 	anyAudible = false
 	for i := 0; i < maxBeds; i++ {
 		p := patients[i]
-		if silenced[i] != "" && silenced[i] != p.AlarmKey {
-			silenced[i] = "" // alarm cleared or changed -> re-arm
+		// An acknowledged alarm stays paused (and its message frozen) until the
+		// condition clears or a HIGHER-priority alarm appears (e.g. yellow -> red).
+		// The condition must stay clear for 5 s (values hovering at a limit
+		// shouldn't re-arm it); escalation re-arms immediately.
+		if acks[i].on {
+			switch {
+			case alarmRank(p.AlarmLvl) > acks[i].rank, p.RemindAt > acks[i].at:
+				// escalation, or an arrhythmia alarm reminder after its timeout
+				acks[i] = ackState{}
+			case p.AlarmText == "":
+				if acks[i].clearSince == 0 {
+					acks[i].clearSince = now()
+				} else if now()-acks[i].clearSince >= 5 {
+					acks[i] = ackState{}
+				}
+			default:
+				acks[i].clearSince = 0
+			}
 		}
-		if i >= nBeds || standby[i] || !showAlarms || p.AlarmText == "" || p.AlarmLvl == 1 || silenced[i] != "" {
+		// short yellow (arrhythmia) alarms sound only briefly when announced
+		// short yellow (arrhythmia) alarms sound only briefly; latched alarms
+		// sound only with audible latching (ToneLvl = 0 when silent)
+		if i >= nBeds || standby[i] || !showAlarms || p.AlarmText == "" || p.ToneLvl == 0 || acks[i].on {
 			continue
 		}
 		anyAudible = true
-		if l := alarmSoundLevel(p.AlarmLvl); l > best {
+		if l := alarmSoundLevel(p.ToneLvl); l > best {
 			best = l
 		}
 	}
@@ -341,9 +430,37 @@ func chooseLead(hwnd uintptr, bed int, r RECT) {
 	}
 }
 
+// ackState is an acknowledged alarm: the message and level shown at the
+// moment it was silenced.
+type ackState struct {
+	on         bool
+	text       string
+	lvl, rank  int
+	clearSince float64 // when the condition went away (0 = still present)
+	at         float64 // when it was acknowledged
+}
+
+// alarmRank orders alarm levels by priority (panic > red > yellow > short yellow > INOP).
+func alarmRank(lvl int) int { return AlarmRank(lvl) }
+
+// shownAlarm returns the alarm message/level to display for a bed, and
+// whether it is acknowledged (frozen while acknowledged).
+func shownAlarm(bed int) (text string, lvl int, ack bool) {
+	if a := acks[bed]; a.on {
+		return a.text, a.lvl, true
+	}
+	p := patients[bed]
+	return p.AlarmText, p.AlarmLvl, false
+}
+
 func silenceBed(i int) {
-	if patients[i].AlarmKey != "" {
-		silenced[i] = patients[i].AlarmKey
+	p := patients[i]
+	if p.AlarmText != "" && !acks[i].on {
+		p.LogEvent("Alarm acknowledged: "+p.AlarmText, 4)
+		p.Acknowledge() // latched red / yellow arrhythmia alarms whose condition ended clear now
+		if p.AlarmText != "" {
+			acks[i] = ackState{on: true, text: p.AlarmText, lvl: p.AlarmLvl, rank: alarmRank(p.AlarmLvl), at: now()}
+		}
 	}
 	forceSound = true // pressing Silence takes effect immediately
 	updateAlarmState()
@@ -352,30 +469,71 @@ func silenceBed(i int) {
 const helpText = `Central Telemetry Station Simulator
 
 PATIENT SECTORS
-- Hover over a patient to show its buttons:
-    [strip icon]   10-second freeze-frame on ECG paper (25 mm/s, 10 mm/mV)
-    Adjust Rhythm  rhythm, rate, ectopy, pacing, SpO2, resp, artifact, standby
-    Fine Tune      PR / QRS / QT, P / QRS / T amplitude, ST segment
-    Alarm Limits   this patient's own limits (or the station-wide ones)
-    [bell icon]    silence this patient's alarm (shown while it is sounding)
-    [window icon]  expand: dock this patient full-width at the bottom of the
-                   board with three ECG leads, Pleth and Resp plus HR,
-                   PVC/min, ST, QT/QTc, SpO2, Pulse and RR. Press it again
-                   (in the sector or the expanded view) to close.
-- Double-click a patient to silence (acknowledge) its alarm.
+- Hover over a patient to show its buttons (as at the Information Center):
+    [strip icon]    10-second freeze-frame on ECG paper (25 mm/s, 10 mm/mV)
+                    with virtual calipers and Save Event (see EVENTS)
+    Manage Patient  name, rhythm, rate, ectopy/events, pacing, conduction,
+                    electrodes-off episodes, Alarms Off, standby
+    Review          the patient's alarm history (date, time, message)
+    Measurements    Setup ECG / Arrhythmia / SpO2 / Resp / NBP / ABP / CO2
+                    windows, and the full alarm limits table
+    [window icon]   expand: dock this patient full-width at the bottom of
+                    the board with every wave and measurement; press again
+                    to close.
+- Click a wave or numeric to open that measurement's Setup window (e.g.
+  Setup SpO2: SpO2 on/off, the patient's SpO2, High / Low / Desat limits,
+  Alarms On/Off). Click a row to pick a value from its pop-up list; drag
+  the window by its title; X or Esc closes it. Changing a limit gives the
+  patient its own limits. "(sim)" rows set the simulated patient's value.
+- Setup ECG also holds the lead, HR / extreme / ST / QTc limits, artifact
+  and Fine Tune; Setup Arrhythmia holds the arrhythmia limits and the
+  individual arrhythmia alarm switches.
+- A numeric whose measurement alarms are off shows a red X; a patient with
+  all alarms off shows an X beside the bed label and "Alarms Off".
+- Double-click a patient to silence (acknowledge) its alarm; double-click
+  the alarm message itself to also open the alarm's 10-second strip.
 - Click the lead label (e.g. "II") to choose I, II, III, aVR, aVL, aVF, V1-V6.
 - Every bed starts in Standby: hover and press "Activate Bed".
 
-ALARMS
-- A new alarm turns the sector background blue and shows a message box at
-  top right with the value and the limit crossed: red (***), yellow (**),
-  cyan (technical, e.g. ECG Leads Off). Once silenced the background
-  returns to black and the message shows a check mark; it re-alarms if the
-  alarm clears and returns, or changes.
-- Extreme limits (xBrady, xTachy, Desat) are PANIC alarms (flashing red box).
-- The station sounds the highest-priority unsilenced alarm. Alarms menu:
-  Silence all, station-wide limits, sound on/off, volume. "Silence All"
-  also appears in the top bar while anything is sounding.
+ALARMS (texts, priorities and criteria follow the Philips IntelliVue
+MX100/X3 Instructions for Use, "Patient Alarms and INOPs")
+- Message box at top right: red *** (e.g. *** Asystole, *** VTach,
+  *** Desat), yellow ** (e.g. ** SpO2 Low), one-star yellow arrhythmia
+  alarms * (e.g. * Pair PVCs, * AFIB, * HR High) and cyan INOPs (e.g.
+  ECG Leads Off, SpO2 No Pulse, NBP Measure Failed).
+- Alarm text Enhanced (Alarms menu): worst value and limit, e.g.
+  *** Desat 78 < 80, *** xBrady 35<40, *** Apnea 0:25. Several alarms of
+  the top priority alternate every 2 s.
+- Alarm latching (Alarms menu, as configured on the monitor): visual and
+  audible latching Red Only / Red&Yellow / Off. A latched alarm keeps its
+  message (and tone, if audible latching) after the condition ends until
+  it is acknowledged. INOPs never latch.
+- One-star arrhythmia alarms: lamp and tone for 6 s, message up to 3 min
+  after the condition ends. Four chains (PVC / Missed Beat / Arrhy HR /
+  AFib-HR): only the highest in each chain is announced; a timeout (TimeOut
+  1st 3 min, 2nd 10 min) blocks the same or a lower alarm, and when it
+  expires a condition still present sounds again as a reminder (even if
+  acknowledged). AFIB / Irregular HR have no timeout; * End AFIB / * End
+  Irregular HR follow after the end delay (60 s, adjustable).
+- Arrhythmia relearn (Learning ECG / Learning Rhythm, ~16 s; only Asystole,
+  Vent Fib/Tach and HR alarms meanwhile) happens when ECG monitoring is
+  switched on, the lead is changed, or a Leads Off of > 60 s ends.
+- Alarms Off then On resets the arrhythmia timeouts. Individual arrhythmia
+  alarms can be switched off in Alarm Limits ("Some ECG AlarmsOff").
+- HR High/Low are short yellow (*) by default, or standard yellow (**,
+  no timeout, no chain) via the Alarms menu.
+- Rhythm status (Sinus Rhythm, Vent Bigeminy, Paced Rhythm, ...) and
+  ectopic status (Pair PVCs, Pause, Pacer Not Capt, ...) show on the ECG.
+- A new alarm turns the sector blue. Silencing (double-click, bell button,
+  Silence All) returns it to black and freezes the message with a check
+  mark until the condition clears or a HIGHER-priority alarm appears.
+- Alarms Off (Manage Patient): switches all of this patient's alarms off
+  (X beside the bed label, "Alarms Off"; INOPs still appear, silently).
+  Each Setup window also has Alarms On/Off for that measurement alone
+  (ECG alarms off shows the INOP "ECG/Arrh AlarmsOff").
+- Alarm limits: HR, extreme deltas, V-Tach HR/run, vent rhythm run, SVT
+  HR/run, PVCs/min, asystole and pause thresholds, ST, QTc (alarms after
+  5 min), SpO2/desat, RR/apnea, NBP, ABP and ABP extreme (red), etCO2.
 
 MONITORING
 - ECG (green) with 1 mV calibration bar and rhythm label; Pleth/SpO2 (cyan);
@@ -385,29 +543,73 @@ MONITORING
 - Waves sweep at real speeds (ECG/Pleth/ABP 25 mm/s, Resp/CO2 6.25 mm/s).
 - ST and QT are measured on the displayed lead (ST-II etc., QTc by Bazett);
   alarms: **ST-<lead> above/below the ST limits, **QTc High.
-- NBP (pink, Adjust Rhythm > right column): Off / Manual / Auto every
+- NBP (pink, Setup NBP): Off / Manual / Auto every
   5-60 min. A cuff cycle takes ~25 s (cuff pressure shown), then sys/dia
   (mean) and the time of the reading. "Measure NBP now" starts one. With no
-  pulse the reading fails ("NBP Measure Failed"). Alarms: **NBPs High/Low.
+  pulse the reading fails (NBP MEASURE FAILED); with weak pulses it reads
+  low. Alarms: **NBPs HIGH/LOW.
 - ABP (red, optional arterial line): beat-by-beat waveform with dicrotic
   notch, 0/150 scale lines and sys/dia (mean) measured from the wave. PVCs
-  give weak pulses; VF/asystole give "ABP Non-Pulsatile". **ABPs High/Low.
+  give weak pulses; V-tach with a pulse lowers the pressure. With no
+  cardiac output (asystole, VF, torsades, pulseless V-tach) the pulsations
+  stop and the pressure runs off to ~17/15 (16) within ~15 s; when a
+  perfusing rhythm returns it recovers over ~20-30 s. **ABPs HIGH/LOW.
+- Ectopy / events (Manage Patient): PVC couplets, triplets and runs of VT
+  (4-12 beats, ~180/min: 5+ alarm *** VTach), PSVT episodes (sudden SVT
+  150-220/min for 8-60 s, started by a PAC; set per hour) and sinus pauses
+  (1.6-3.6 s; over 2 s alarm * Pause).
+- Bundle branch block: Manage Patient > Conduction: RBBB (rSR' in V1,
+  broad S in I/V6) or LBBB (broad notched R in I/V6, deep QS in V1,
+  discordant T) for any rhythm with conducted beats.
+- Pacing modes include intermittent failure to capture / to pace
+  (* Pacer Not Capt / * Pacer Not Pacing).
+- Pulseless V-tach: tick "Pulseless" in Manage Patient when V-tach is
+  selected - no pleth (SpO2 NON-PULSAT.), falling ABP and EtCO2, NBP fails.
 - EtCO2 (yellow, optional capnography): capnogram per breath, etCO2 and
-  awRR. Works even with ECG leads off. **etCO2 High/Low, ***Apnea.
+  awRR. Works even with ECG leads off. EtCO2 falls when there is no cardiac
+  output. **etCO2 HIGH/LOW, **awRR HIGH/LOW, ***APNEA.
 
 SCENARIOS (Patients menu)
 - Randomize: any rhythm including lethal ones.
 - Typical ER board / med-surg tele floor / step-down unit: realistic rhythm
-  mixes for each unit (med-surg: older patients, more AF and pacemakers, few
-  with SpO2 or NBP on the monitor; step-down: sicker, more tachycardia and
+  mixes for each unit (med-surg: older, stable patients, more rate-
+  controlled AF and pacemakers, unstable rhythms rare, no SpO2 or NBP; step-down: sicker, more tachycardia and
   RVR, SpO2 and NBP on most, a few arterial lines), natural per-patient
   variation, some artifact, no lethal rhythms.
 - ICU: sickest mix (more tachycardia, RVR, blocks, escape rhythms), SpO2
   on nearly everyone, many arterial lines and capnography (ventilated).
 - Click the NBP title ("NBP 17:03 Auto 15 min") on any patient for a menu:
   Auto 1 min ... 8 hr, Manual, Measure NBP now, Turn NBP off.
-- Scenario odds: % of patients per unit with SpO2, auto NBP, ABP, EtCO2
-  and artifact.
+- Scenario odds: % of patients per unit with SpO2, auto NBP, ABP, EtCO2,
+  artifact and electrodes that come off now and then.
+- Every preset (and Randomize) includes a few patients with the leads off
+  and a few whose electrodes come off intermittently (ECG Leads Off for
+  ~10 s - 4 min, then reattached; > 60 s triggers an arrhythmia relearn).
+  Tick "Electrodes come off now and then" in Manage Patient for any patient.
+
+CALIPERS AND EVENT LOG
+- Double-click a red or yellow alarm message to open the 10-second strip of
+  the rhythm that triggered it (6 s before to 4 s after the onset, marked
+  "alarm"); this also acknowledges the alarm.
+- On any strip, drag with the LEFT mouse button to measure an interval
+  (ms and rate per minute), with the RIGHT button for an amplitude (mV and
+  mm). Drag a caliper line to move it; Clear Calipers removes them.
+- Below the strip: Rhythm, HR, PR, QRS, QT, QTc, R-R and ST boxes and a
+  free-text Note. Click into a box, then "<- Caliper into box" to copy the
+  caliper reading (a rate for HR, mm for ST). QTc is calculated (Bazett) if
+  left empty. "Save to Event Log" stores the strip with the alarm name and
+  time; save again to update it, Delete Event removes it.
+- Events > Event Log lists the events (newest first: time, bed, patient,
+  alarm, interpretation, note); open one to view, measure or edit it. The
+  log is kept for this session only and is cleared when the program closes.
+
+RHYTHM QUIZ (Quiz menu)
+- Ten 10-second strips generated by the simulator (31 rhythms: sinus,
+  atrial, junctional, AV blocks, ventricular, paced, ectopy, bundle branch
+  blocks), each with four answers - mostly similar rhythms as distractors.
+  Pick one and press Check Answer to see the rhythm and a teaching point;
+  Next Rhythm moves on. Score is shown at the top; calipers work on the
+  strip. New Quiz starts over.
 
 VIEW MENU: number of sectors, columns, sweep speed, frame rate, alarm
 messages and rhythm labels on/off (turn messages off to quiz recognition).
@@ -424,6 +626,15 @@ func mainProc(hwnd, msg, wp, lp uintptr) uintptr {
 		updateAlarmState()
 		updateHover(hwnd)
 		call(pInvalidateRect, hwnd, 0, 0)
+		if pendingClick.on && t-pendingClick.at > 0.45 { // not a double-click
+			pendingClick.on = false
+			openMeas(pendingClick.bed, pendingClick.meas, pendingClick.x, pendingClick.y)
+		}
+		if measHwnd != 0 && int(t*4) != measTick { // keep live values current
+			measTick = int(t * 4)
+			call(pInvalidateRect, measHwnd, 0, 0)
+		}
+		refreshReview()
 		return 0
 	case WM_ERASEBKGND:
 		return 1
@@ -483,8 +694,18 @@ func mainProc(hwnd, msg, wp, lp uintptr) uintptr {
 		return 0
 	case WM_LBUTTONDBLCLK:
 		// double-click a patient to silence (acknowledge) its alarm
+		pendingClick.on = false
 		x, y := lpX(lp), lpY(lp)
 		for _, s := range sectors {
+			if s.rc.contains(x, y) && s.alarm.contains(x, y) && !standby[s.bed] {
+				// double-click a red/yellow alarm message: the strip of the
+				// rhythm that triggered it (and acknowledge it)
+				if _, lvl, _ := shownAlarm(s.bed); IsPatientAlarm(lvl) {
+					openAlarmStrip(s.bed)
+					silenceBed(s.bed)
+					continue
+				}
+			}
 			if s.rc.contains(x, y) {
 				onBtn := s.lead.contains(x, y) || s.nbp.contains(x, y)
 				for _, b := range s.btns {
@@ -547,6 +768,33 @@ func mainProc(hwnd, msg, wp, lp uintptr) uintptr {
 		case id == idSilAll:
 			for i := 0; i < maxBeds; i++ {
 				silenceBed(i)
+			}
+		case id >= idLatchBase && id < idLatchBase+len(LatchCombos):
+			VisualLatch, AudibleLatch = LatchCombos[id-idLatchBase][0], LatchCombos[id-idLatchBase][1]
+			updateChecks()
+			t := now()
+			for _, p := range patients {
+				p.computeHR(t)
+			}
+			updateAlarmState()
+		case id == idQuiz:
+			openQuiz()
+		case id == idEvents:
+			openEventList()
+		case id == idHRStd:
+			HRStandardYellow = !HRStandardYellow
+			updateChecks()
+			t := now()
+			for _, p := range patients {
+				p.computeHR(t)
+			}
+			updateAlarmState()
+		case id == idNumAlarm:
+			AlarmNumeric = !AlarmNumeric
+			updateChecks()
+			t := now()
+			for _, p := range patients {
+				p.computeHR(t)
 			}
 		case id == idSound:
 			soundOn = !soundOn
@@ -775,7 +1023,7 @@ func openStrip(bed int) {
 		s.hr = "HR -?-"
 	}
 	if showAlarms {
-		s.alarm, s.lvl = p.AlarmText, p.AlarmLvl
+		s.alarm, s.lvl, _ = shownAlarm(bed)
 	}
 	switch p.Cfg.SpO2On {
 	case SpO2Monitored:
@@ -792,17 +1040,26 @@ func openStrip(bed int) {
 	for _, tp := range p.PacesBetween(t0, t1) {
 		s.paces = append(s.paces, tp-t0)
 	}
+	s.status = strings.TrimSpace(p.RhythmStatus + "  " + p.EctopicStatus)
+	showStrip(s, fmt.Sprintf("%s - 10 second strip - %s", bedLabel(bed), s.when))
+}
+
+// showStrip opens a strip window (live freeze-frame or saved event).
+func showStrip(s *Strip, title string) {
 	sw := float64(call(pGetSystemMetrics, 0))
 	w := int32(math.Min(sw*0.92, 1400*dpiScale))
-	h := int32(float64(w) * 0.36)
-	title := fmt.Sprintf("%s - 10 second strip - %s", bedLabel(bed), s.when)
-	hwnd := call(pCreateWindowExW, 0, uintptr(unsafe.Pointer(wstr("TeleSimStrip"))), uintptr(unsafe.Pointer(wstr(title))), WS_OVERLAPPEDWINDOW|WS_VISIBLE,
+	h := int32(float64(w)*0.36) + stripHeader(s) - S(58) + stripPanelH()
+	hwnd := call(pCreateWindowExW, 0, uintptr(unsafe.Pointer(wstr("TeleSimStrip"))), uintptr(unsafe.Pointer(wstr(title))), WS_OVERLAPPEDWINDOW|WS_VISIBLE|0x02000000, // WS_CLIPCHILDREN
 		CW_USEDEFAULT, CW_USEDEFAULT, uintptr(w), uintptr(h), mainHwnd, 0, hInst, 0)
 	strips[hwnd] = s
+	stripButtons(hwnd, s)
 	call(pInvalidateRect, hwnd, 0, 0)
 }
 
 func stripProc(hwnd, msg, wp, lp uintptr) uintptr {
+	if s, ok := strips[hwnd]; ok && stripTool(hwnd, s, uint32(msg), wp, lp) {
+		return 0
+	}
 	switch uint32(msg) {
 	case WM_ERASEBKGND:
 		return 1
@@ -837,28 +1094,46 @@ func drawStrip(dc uintptr, s *Strip, w, h int32) {
 	black := rgb(0, 0, 0)
 	fill(dc, 0, 0, w, h, rgb(255, 255, 255))
 	m := S(16)
-	headH := S(58)
+	headH := stripHeader(s)
 
 	title := bedLabel(s.bed)
 	if s.name != "" {
 		title += "    " + s.name
 	}
-	text(dc, title, m, S(6), w-m, S(30), black, font(S(19), true, "Segoe UI"), DT_SINGLELINE)
+	if s.quiz != nil {
+		quizHeader(dc, s, w)
+	} else {
+		text(dc, title, m, S(6), w-m, S(30), black, font(S(19), true, "Segoe UI"), DT_SINGLELINE)
+	}
 	hr := s.hr
 	if s.spo2 != "" {
 		hr += "     " + s.spo2
 	}
 	info := s.when + "     " + hr + "     Lead " + s.lead + "     25 mm/s     10 mm/mV     10 s freeze-frame"
-	text(dc, info, m, S(30), w-m, S(52), rgb(40, 40, 40), font(S(14), false, "Segoe UI"), DT_SINGLELINE|DT_END_ELLIPSIS)
+	if s.quiz == nil {
+		text(dc, info, m, S(30), w-m, S(52), rgb(40, 40, 40), font(S(14), false, "Segoe UI"), DT_SINGLELINE|DT_END_ELLIPSIS)
+	}
 	if s.alarm != "" {
 		c := rgb(200, 0, 0)
-		if s.lvl < 3 {
-			c = rgb(150, 110, 0)
-		} else if s.lvl == 4 {
+		if s.lvl == 4 {
 			c = rgb(0, 120, 160)
+		} else if s.lvl < 3 {
+			c = rgb(150, 110, 0)
 		}
 		text(dc, s.alarm, w/2, S(6), w-m, S(30), c, font(S(18), true, "Segoe UI"), DT_SINGLELINE|DT_RIGHT)
 	}
+	l3 := ""
+	if s.isAlarm {
+		l3 = "Alarm strip: " + strings.TrimSpace(s.alarm) + " at " + s.at.Format("15:04:05") + "  (6 s before to 4 s after onset)"
+	}
+	if s.status != "" {
+		if l3 != "" {
+			l3 += "     "
+		}
+		l3 += "Monitor: " + s.status
+	}
+	text(dc, l3, m, S(54), w/2-S(8), S(76), rgb(120, 0, 0), font(S(14), true, "Segoe UI"), DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS)
+	h -= stripPanelH() // the event-log panel sits below the grid
 
 	gl := float64(m)
 	pxmm := float64(w-2*m) / 250.0
@@ -917,8 +1192,10 @@ func drawStrip(dc uintptr, s *Strip, w, h int32) {
 		pts[i] = POINT{int32(math.Round(x)), int32(math.Round(y))}
 	}
 	polyline(dc, pts, pen(black, int32(math.Max(1, math.Round(1.7*dpiScale)))))
+	s.cal.gl, s.cal.pxmm, s.cal.gt, s.cal.gb, s.cal.yb = gl, pxmm, gt, gb, yb
+	defer drawStripTools(dc, s, w)
 	// pacer spikes: thin dark marker from the top of the grid down to the trace
-	sp := pen(rgb(30, 30, 30), int32(math.Max(1, math.Round(1.2*dpiScale))))
+	sp := pen(rgb(30, 30, 30), int32(math.Max(2, math.Round(2.4*dpiScale)))) // pacer spikes: a little wider
 	for _, tp := range s.paces {
 		i := int(tp * FS)
 		if i < 0 || i >= len(pts) {

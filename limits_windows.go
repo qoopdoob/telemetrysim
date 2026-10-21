@@ -4,8 +4,8 @@ package main
 
 // Alarm Limits window. Opened from the Alarms menu it edits the station-wide
 // limits; opened from a sector's "Limits" button it edits that patient's own
-// limits (or sets the patient back to the station-wide ones). The "extreme"
-// limits raise a red panic alarm.
+// limits (or sets the patient back to the station-wide ones). It also holds
+// the arrhythmia alarm limits (V-Tach HR/run, SVT, PVCs/min, thresholds).
 
 import (
 	"fmt"
@@ -15,54 +15,74 @@ import (
 	"unsafe"
 )
 
-const ctlUseStation = 40
+const (
+	ctlUseStation = 40
+	ctlAllYelOff  = 41
+	ctlAllYelOn   = 42
+)
+
+// limField describes one editable limit: an int or a float64 (one decimal).
+type limField struct {
+	label, unit string
+	i           func(l *AlarmLimits) *int
+	f           func(l *AlarmLimits) *float64
+}
+
+var limFields = []limField{
+	// column 1: heart rate and arrhythmia
+	{"HR low limit:", "bpm", func(l *AlarmLimits) *int { return &l.HRLow }, nil},
+	{"HR high limit:", "bpm", func(l *AlarmLimits) *int { return &l.HRHigh }, nil},
+	{"\u2206ExtrBrady (below HR low):", "bpm", func(l *AlarmLimits) *int { return &l.ExtBradyD }, nil},
+	{"\u2206ExtrTachy (above HR high):", "bpm", func(l *AlarmLimits) *int { return &l.ExtTachyD }, nil},
+	{"V-Tach HR:", "bpm", func(l *AlarmLimits) *int { return &l.VTachHR }, nil},
+	{"V-Tach run:", "PVCs", func(l *AlarmLimits) *int { return &l.VTachRun }, nil},
+	{"Vent rhythm run:", "PVCs", func(l *AlarmLimits) *int { return &l.VentRhythmRun }, nil},
+	{"SVT HR:", "bpm", func(l *AlarmLimits) *int { return &l.SVTHR }, nil},
+	{"SVT run:", "SV beats", func(l *AlarmLimits) *int { return &l.SVTRun }, nil},
+	{"PVCs/min:", "/min", func(l *AlarmLimits) *int { return &l.PVCsMin }, nil},
+	{"Asystole threshold:", "sec", nil, func(l *AlarmLimits) *float64 { return &l.AsystoleSec }},
+	{"Pause threshold:", "sec", nil, func(l *AlarmLimits) *float64 { return &l.PauseSec }},
+	{"AFib/IHR end delay:", "sec", func(l *AlarmLimits) *int { return &l.AfEndDelay }, nil},
+	{"ST high limit:", "mm", nil, func(l *AlarmLimits) *float64 { return &l.STHigh }},
+	{"ST low limit:", "mm", nil, func(l *AlarmLimits) *float64 { return &l.STLow }},
+	// column 2: other measurements
+	{"QTc high limit:", "ms", func(l *AlarmLimits) *int { return &l.QTcHigh }, nil},
+	{"SpO\u2082 low limit:", "%", func(l *AlarmLimits) *int { return &l.SpO2Low }, nil},
+	{"SpO\u2082 desat limit:", "%", func(l *AlarmLimits) *int { return &l.Desat }, nil},
+	{"RR low limit:", "rpm", func(l *AlarmLimits) *int { return &l.RRLow }, nil},
+	{"RR high limit:", "rpm", func(l *AlarmLimits) *int { return &l.RRHigh }, nil},
+	{"Apnea time:", "sec", func(l *AlarmLimits) *int { return &l.ApneaSec }, nil},
+	{"NBPs high limit:", "mmHg", func(l *AlarmLimits) *int { return &l.NBPsHigh }, nil},
+	{"NBPs low limit:", "mmHg", func(l *AlarmLimits) *int { return &l.NBPsLow }, nil},
+	{"ABPs high limit:", "mmHg", func(l *AlarmLimits) *int { return &l.ABPsHigh }, nil},
+	{"ABPs low limit:", "mmHg", func(l *AlarmLimits) *int { return &l.ABPsLow }, nil},
+	{"ABPs extreme high (red):", "mmHg", func(l *AlarmLimits) *int { return &l.ABPsXHigh }, nil},
+	{"ABPs extreme low (red):", "mmHg", func(l *AlarmLimits) *int { return &l.ABPsXLow }, nil},
+	{"etCO\u2082 high limit:", "mmHg", func(l *AlarmLimits) *int { return &l.EtCO2High }, nil},
+	{"etCO\u2082 low limit:", "mmHg", func(l *AlarmLimits) *int { return &l.EtCO2Low }, nil},
+}
+
+const limRows = 15
 
 var (
 	limitsHwnd uintptr
-	limEdits   [18]uintptr
+	limEdits   [29]uintptr
+	limArrBox  [16]uintptr
 	limBed     = -1 // -1 = station-wide
 	hUseStn    uintptr
+	hLimNote   uintptr
 )
 
-var limitLabels = []string{
-	"HR low (yellow) below:",
-	"HR high (yellow) above:",
-	"Extreme brady - PANIC below:",
-	"Extreme tachy - PANIC above:",
-	"SpO2 low (yellow) below:",
-	"Desat - PANIC below:",
-	"RR low (yellow) below:",
-	"RR high (yellow) above:",
-	"Apnea (red) after no breath for:",
-	"ST high (yellow) above:",
-	"ST low (yellow) below:",
-	"QTc high (yellow) above:",
-	"NBP systolic high above:",
-	"NBP systolic low below:",
-	"ABP systolic high above:",
-	"ABP systolic low below:",
-	"etCO2 high above:",
-	"etCO2 low below:",
-}
-
-var limitUnits = []string{"bpm", "bpm", "bpm", "bpm", "%", "%", "rpm", "rpm", "sec",
-	"mm", "mm", "ms", "mmHg", "mmHg", "mmHg", "mmHg", "mmHg", "mmHg"}
-
-// fields 9 and 10 (ST) are decimal millimetres; the rest are integers
-func limitIsFloat(i int) bool { return i == 9 || i == 10 }
-
 func limitGet(l *AlarmLimits, i int) string {
-	if limitIsFloat(i) {
-		return strconv.FormatFloat([]float64{l.STHigh, l.STLow}[i-9], 'f', 1, 64)
+	if f := limFields[i]; f.f != nil {
+		return strconv.FormatFloat(*f.f(l), 'f', 1, 64)
 	}
-	return strconv.Itoa(*limitFields(l)[i])
+	return strconv.Itoa(*limFields[i].i(l))
 }
 
-// limitFields returns the integer fields by index (nil for the ST floats).
-func limitFields(l *AlarmLimits) []*int {
-	return []*int{&l.HRLow, &l.HRHigh, &l.HRExtLow, &l.HRExtHigh, &l.SpO2Low, &l.SpO2ExtLow,
-		&l.RRLow, &l.RRHigh, &l.ApneaSec, nil, nil, &l.QTcHigh,
-		&l.NBPsHigh, &l.NBPsLow, &l.ABPsHigh, &l.ABPsLow, &l.EtCO2High, &l.EtCO2Low}
+func extremeNote(l AlarmLimits) string {
+	return fmt.Sprintf("Extreme Brady < %d bpm, Extreme Tachy > %d bpm (clamped at %d / %d bpm). Red alarms latch until silenced.",
+		l.XBrady(), l.XTachy(), BradyClamp, TachyClamp)
 }
 
 // openLimits edits the limits for bed (or the station-wide limits if bed < 0).
@@ -76,7 +96,10 @@ func openLimits(bed int) {
 	}
 	limBed = bed
 	uiFont = font(S(15), false, "Segoe UI")
-	w, h := S(800), S(510)
+	w, h := S(1110), S(708)
+	if bed >= 0 {
+		h += S(38) // room for "Use station-wide limits"
+	}
 	var mr RECT
 	call(pGetWindowRect, mainHwnd, uintptr(unsafe.Pointer(&mr)))
 	x := mr.Left + (mr.Right-mr.Left-w)/2
@@ -99,24 +122,33 @@ func openLimits(bed int) {
 		}
 		top += S(38)
 	}
-	for i, l := range limitLabels {
-		col, rowi := i/9, i%9
-		x := S(16) + S(390)*int32(col)
-		y := top + S(36)*int32(rowi)
-		ctl("STATIC", l, 0, x, y+S(3), S(240), S(22), 0)
+	for i, fd := range limFields {
+		col, rowi := i/limRows, i%limRows
+		x := S(16) + S(400)*int32(col)
+		y := top + S(34)*int32(rowi)
+		ctl("STATIC", fd.label, 0, x, y+S(3), S(220), S(22), 0)
 		style := uint32(WS_TABSTOP | ES_NUMBER)
-		if limitIsFloat(i) {
+		if fd.f != nil {
 			style = WS_TABSTOP | ES_AUTOHSCROLL // allows "-" and "."
 		}
-		limEdits[i] = ctl("EDIT", limitGet(&cur, i), style, x+S(246), y, S(60), S(26), 50+i)
-		ctl("STATIC", limitUnits[i], 0, x+S(314), y+S(3), S(50), S(22), 0)
+		limEdits[i] = ctl("EDIT", limitGet(&cur, i), style, x+S(226), y, S(60), S(26), 50+i)
+		ctl("STATIC", fd.unit, 0, x+S(294), y+S(3), S(70), S(22), 0)
 	}
-	note := "PANIC = red alarm tone, flashing red sector."
-	if bed < 0 {
-		note += " Beds with their own limits keep them."
+	// column 3: arrhythmia alarms switched on/off individually
+	ax := S(16) + S(400)*2
+	ctl("STATIC", "Arrhythmia alarms (on/off):", 0, ax, top+S(3), S(260), S(22), 0)
+	for i, sw := range ArrSwitches {
+		col, rowi := i/8, i%8
+		limArrBox[i] = ctl("BUTTON", sw.Name, WS_TABSTOP|BS_AUTOCHECKBOX, ax+S(140)*int32(col), top+S(30)+S(32)*int32(rowi), S(135), S(26), 200+i)
+		if cur.ArrOff&(1<<uint(i)) == 0 {
+			call(pSendMessageW, limArrBox[i], BM_SETCHECK, 1, 0)
+		}
 	}
-	ctl("STATIC", note, 0, S(16), top+S(36)*9+S(2), S(560), S(40), 0)
-	by := top + S(36)*9 + S(46)
+	ctl("BUTTON", "All Yellow Off", WS_TABSTOP, ax, top+S(30)+S(32)*8+S(6), S(130), S(28), ctlAllYelOff)
+	ctl("BUTTON", "All Yellow On", WS_TABSTOP, ax+S(140), top+S(30)+S(32)*8+S(6), S(130), S(28), ctlAllYelOn)
+	ctl("STATIC", "Alarms switched off are not announced\n(INOP: Some ECG AlarmsOff).", 0, ax, top+S(30)+S(32)*9+S(10), S(280), S(44), 0)
+	hLimNote = ctl("STATIC", extremeNote(cur), 0, S(16), top+S(34)*limRows+S(4), S(1060), S(40), 0)
+	by := top + S(34)*limRows + S(48)
 	ctl("BUTTON", "OK", WS_TABSTOP|BS_DEFPUSHBUTTON, w-S(230), by, S(90), S(30), 1)
 	ctl("BUTTON", "Cancel", WS_TABSTOP, w-S(130), by, S(90), S(30), 2)
 	refreshLimits()
@@ -135,6 +167,16 @@ func refreshLimits() {
 		enable(e, !useStn)
 		if useStn { // show the station values that will apply
 			call(pSetWindowTextW, e, uintptr(unsafe.Pointer(wstr(limitGet(&Limits, i)))))
+		}
+	}
+	for i, b := range limArrBox {
+		enable(b, !useStn)
+		if useStn {
+			v := uintptr(1)
+			if Limits.ArrOff&(1<<uint(i)) != 0 {
+				v = 0
+			}
+			call(pSendMessageW, b, BM_SETCHECK, v, 0)
 		}
 	}
 }
@@ -156,55 +198,62 @@ func applyLimits() bool {
 		patients[limBed].computeHR(now())
 		return true
 	}
-	var v [18]int
-	var stHi, stLo float64
-	for i := range v {
-		if limitIsFloat(i) {
-			f, err := strconv.ParseFloat(strings.TrimSpace(strings.ReplaceAll(getText(limEdits[i]), ",", ".")), 64)
+	var l AlarmLimits
+	for i, fd := range limFields {
+		txt := strings.TrimSpace(strings.ReplaceAll(getText(limEdits[i]), ",", "."))
+		if fd.f != nil {
+			v, err := strconv.ParseFloat(txt, 64)
 			if err != nil {
-				messageBox(limitsHwnd, "ST limits must be numbers in mm, e.g. 2.0 and -2.0", "Alarm Limits", 0x30)
+				messageBox(limitsHwnd, fd.label+" must be a number", "Alarm Limits", 0x30)
 				return false
 			}
-			if i == 9 {
-				stHi = f
-			} else {
-				stLo = f
-			}
-			continue
-		}
-		v[i], _ = strconv.Atoi(getText(limEdits[i]))
-	}
-	if !(stLo < stHi) || stHi > 10 || stLo < -10 {
-		messageBox(limitsHwnd, "ST limits: ST low must be below ST high (within -10 to +10 mm)", "Alarm Limits", 0x30)
-		return false
-	}
-	if v[11] < 300 || v[11] > 800 {
-		messageBox(limitsHwnd, "QTc high must be between 300 and 800 ms", "Alarm Limits", 0x30)
-		return false
-	}
-	if !(v[13] < v[12] && v[15] < v[14] && v[17] < v[16]) {
-		messageBox(limitsHwnd, "For NBP, ABP and etCO2 the low limit must be below the high limit", "Alarm Limits", 0x30)
-		return false
-	}
-	if !(v[2] < v[0] && v[0] < v[1] && v[1] < v[3]) {
-		messageBox(limitsHwnd, "Heart-rate limits must be in order:\nExtreme brady < HR low < HR high < Extreme tachy", "Alarm Limits", 0x30)
-		return false
-	}
-	if !(v[5] < v[4] && v[4] <= 100 && v[5] >= 50) {
-		messageBox(limitsHwnd, "SpO2 limits must satisfy: 50 <= Desat < SpO2 low <= 100", "Alarm Limits", 0x30)
-		return false
-	}
-	if !(v[6] < v[7] && v[6] >= 0 && v[8] >= 5 && v[8] <= 120) {
-		messageBox(limitsHwnd, "Respiratory limits: RR low must be below RR high, and apnea time 5-120 s", "Alarm Limits", 0x30)
-		return false
-	}
-	var l AlarmLimits
-	for i, f := range limitFields(&l) {
-		if f != nil {
-			*f = v[i]
+			*fd.f(&l) = math.Round(v*10) / 10
+		} else {
+			*fd.i(&l), _ = strconv.Atoi(txt)
 		}
 	}
-	l.STHigh, l.STLow = math.Round(stHi*10)/10, math.Round(stLo*10)/10
+	for i, b := range limArrBox {
+		if call(pSendMessageW, b, BM_GETCHECK, 0, 0) != 1 {
+			l.ArrOff |= 1 << uint(i)
+		}
+	}
+	bad := func(msg string) bool { messageBox(limitsHwnd, msg, "Alarm Limits", 0x30); return false }
+	switch {
+	case !(l.HRLow >= 15 && l.HRLow < l.HRHigh && l.HRHigh <= 300):
+		return bad("HR limits: 15 <= HR low < HR high <= 300 bpm")
+	case l.ExtBradyD < 0 || l.ExtBradyD > 50 || l.ExtTachyD < 0 || l.ExtTachyD > 50:
+		return bad("\u2206ExtrBrady and \u2206ExtrTachy must be 0 - 50 bpm")
+	case l.VTachHR < 20 || l.VTachHR > 300:
+		return bad("V-Tach HR must be 20 - 300 bpm")
+	case l.VTachRun < 3 || l.VTachRun > 99:
+		return bad("V-Tach run must be 3 - 99 PVCs")
+	case l.VentRhythmRun < 2 || l.VentRhythmRun > 99:
+		return bad("Vent rhythm run must be 2 - 99 PVCs")
+	case l.SVTHR < 120 || l.SVTHR > 300:
+		return bad("SVT HR must be 120 - 300 bpm")
+	case l.SVTRun < 3 || l.SVTRun > 99:
+		return bad("SVT run must be 3 - 99 SV beats")
+	case l.PVCsMin < 1 || l.PVCsMin > 99:
+		return bad("PVCs/min must be 1 - 99")
+	case l.AsystoleSec < 2.5 || l.AsystoleSec > 10:
+		return bad("Asystole threshold must be 2.5 - 10 seconds")
+	case l.PauseSec < 1.5 || l.PauseSec > 5 || l.PauseSec >= l.AsystoleSec:
+		return bad("Pause threshold must be 1.5 - 5 seconds and below the asystole threshold")
+	case l.AfEndDelay < 10 || l.AfEndDelay > 600:
+		return bad("AFib/IHR end delay must be 10 - 600 seconds")
+	case l.QTcHigh < 200 || l.QTcHigh > 800:
+		return bad("QTc high must be 200 - 800 ms")
+	case !(l.Desat >= 50 && l.Desat <= l.SpO2Low && l.SpO2Low <= 100):
+		return bad("SpO2 limits: 50 <= desat <= SpO2 low <= 100")
+	case !(l.RRLow >= 0 && l.RRLow < l.RRHigh && l.ApneaSec >= 5 && l.ApneaSec <= 120):
+		return bad("Respiratory limits: RR low must be below RR high, and apnea time 5 - 120 s")
+	case !(l.STLow < l.STHigh && l.STHigh <= 20 && l.STLow >= -20):
+		return bad("ST limits: ST low must be below ST high (within -20 to +20 mm)")
+	case !(l.NBPsLow < l.NBPsHigh && l.ABPsLow < l.ABPsHigh && l.EtCO2Low < l.EtCO2High):
+		return bad("For NBP, ABP and etCO2 the low limit must be below the high limit")
+	case !(l.ABPsXLow <= l.ABPsLow && l.ABPsHigh <= l.ABPsXHigh):
+		return bad("ABP extreme limits must lie outside the ABP limits:\nextreme low <= low < high <= extreme high")
+	}
 	if limBed >= 0 {
 		patients[limBed].Lim = &l
 	} else {
@@ -230,6 +279,14 @@ func limitsProc(hwnd, msg, wp, lp uintptr) uintptr {
 			closeLimits()
 		case ctlUseStation:
 			refreshLimits()
+		case ctlAllYelOff, ctlAllYelOn:
+			v := uintptr(0)
+			if loword(wp) == ctlAllYelOn {
+				v = 1
+			}
+			for _, b := range limArrBox {
+				call(pSendMessageW, b, BM_SETCHECK, v, 0)
+			}
 		}
 		return 0
 	case WM_CLOSE:

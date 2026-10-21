@@ -30,10 +30,15 @@ func drawExpanded(dc uintptr, bed int, rc RECT, t float64) {
 	idx := len(sectors)
 	hovered := hoverSec == idx
 	sw := float64(in.Right - in.Left)
+	curHits = nil
 
 	alarmOn := showAlarms && p.AlarmText != ""
-	isSil := alarmOn && silenced[bed] != ""
-	newAlarm := alarmOn && !isSil && p.AlarmLvl != 1
+	aText, aLvl, isSil := shownAlarm(bed)
+	alarmOn = alarmOn || (showAlarms && isSil)
+	isSil = alarmOn && isSil
+	// INOPs (technical) don't turn the sector blue; a latched short-yellow
+	// arrhythmia message only does while its condition is present
+	newAlarm := alarmOn && !isSil && p.AlarmLvl != 4 && (p.AlarmLvl != 1 || p.AlarmFresh)
 	blink := int(t*4)%2 == 0
 	bg := rgb(0, 0, 0)
 	if newAlarm {
@@ -48,13 +53,8 @@ func drawExpanded(dc uintptr, bed int, rc RECT, t float64) {
 	hf := font(fh, true, "Segoe UI")
 	text(dc, strings.ToUpper(bedLabel(bed)), in.Left+S(6), in.Top, in.Left+S(90), in.Top+l1, cWhite, hf, DT_SINGLELINE|DT_VCENTER)
 	text(dc, displayName(p), in.Left+S(90), in.Top, in.Left+int32(sw*0.4), in.Top+l1, cWhite, hf, DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS)
-	if alarmOn && p.AlarmLvl != 1 {
-		msg := p.AlarmText
-		if isSil {
-			msg = "✓ " + msg
-		}
-		alarmBox(dc, in.Right, in.Top, in.Top+l1, int32(sw*0.36), msg, p.AlarmLvl, isSil, blink, fh)
-	}
+	drawAlarmArea(dc, p, in.Right, in.Top, in.Top+l1, int32(sw*0.36), alarmOn, aText, aLvl, isSil, blink, fh)
+	geom.alarm = lastAlarmRect
 
 	ecgOn := !p.Cfg.CardiacOff
 	spo2On := p.Cfg.SpO2On != SpO2Off
@@ -127,6 +127,7 @@ func drawExpanded(dc uintptr, bed int, rc RECT, t float64) {
 		r := RECT{wave.Left, int32(y), wave.Right, int32(y + h)}
 		y += h
 		tr := RECT{r.Left + labW, r.Top, r.Right, r.Bottom}
+		curHits = append(curHits, mhit{tr, measOfKind(x.kind)})
 		switch x.kind {
 		case kHR:
 			lr := RECT{r.Left + S(4), r.Top + S(1), r.Left + S(4) + textWidth(dc, x.lead, lf) + S(8), r.Top + S(18)}
@@ -207,15 +208,7 @@ func drawExpanded(dc uintptr, bed int, rc RECT, t float64) {
 		if ecgOn {
 			specs = append(specs, bStrip)
 		}
-		specs = append(specs, bRhythm)
-		if ecgOn {
-			specs = append(specs, bTune)
-		}
-		specs = append(specs, bLimits)
-		if alarmOn && !isSil {
-			specs = append(specs, bSilence)
-		}
-		specs = append(specs, bExpand)
+		specs = append(specs, bRhythm, bReview, bMeas, bExpand)
 		expandedNow = true
 		geom.btns = layoutButtons(dc, in, specs, p, idx)
 	}

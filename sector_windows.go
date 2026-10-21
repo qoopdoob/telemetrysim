@@ -38,6 +38,9 @@ const (
 	bSilence
 	bActivate
 	bExpand // dock the patient in the expanded view at the bottom (or collapse it)
+	bAlarms // switch this patient's alarms off / on
+	bReview // alarm review
+	bMeas   // measurement setup windows
 )
 
 type hbtn struct {
@@ -81,60 +84,6 @@ func updateHover(hwnd uintptr) {
 	}
 }
 
-// rhythmLabel is the arrhythmia-analysis label shown over the ECG.
-func rhythmLabel(p *Patient) string {
-	c := p.Cfg
-	if c.CardiacOff || c.Rhythm == RLeadsOff {
-		return ""
-	}
-	if c.Ectopy == EctPVCUni || c.Ectopy == EctPVCMulti {
-		switch c.Pattern {
-		case PatBigeminy:
-			return "Vent Bigeminy"
-		case PatTrigeminy:
-			return "Vent Trigeminy"
-		}
-	}
-	hr := p.HR
-	byRate := func(base string) string {
-		switch {
-		case hr > 100:
-			return base + " Tach"
-		case hr < 60:
-			return base + " Brady"
-		}
-		return base + " Rhythm"
-	}
-	switch c.Rhythm {
-	case RAsystole:
-		return "Asystole"
-	case RSinus, RSinusArrhythmia, RFirstDegree, RMobitzI, RMobitzII:
-		return byRate("Sinus")
-	case RAfib:
-		return "Atrial Fib"
-	case RAflutter, RSVT, RJunctional:
-		return byRate("Supravent")
-	case RThirdDegree:
-		if c.Rate >= 40 {
-			return byRate("Supravent")
-		}
-		return "Vent Brady"
-	case RIdioventricular:
-		return "Vent Rhythm"
-	case RVTach:
-		return "V-Tach"
-	case RTorsades, RVFibCoarse, RVFibFine:
-		return "V-Fib/V-Tach"
-	case RPaced:
-		return "Vent Paced"
-	case RAPaced:
-		return "Atrial Paced"
-	case RAVPaced:
-		return "A-V Paced"
-	}
-	return ""
-}
-
 func displayName(p *Patient) string {
 	if p.Cfg.Name == "" {
 		return "Not Admitted"
@@ -142,19 +91,21 @@ func displayName(p *Patient) string {
 	return p.Cfg.Name
 }
 
-// statusLabel is the text shown on the ECG: an arrhythmia status message such
-// as "Irregular HR" (bold) while one is active, otherwise the rhythm label.
+// statusLabel is the text shown on the primary ECG: the arrhythmia rhythm
+// status message (e.g. "Sinus Rhythm", "Vent Bigeminy", "Irregular HR")
+// followed by the ectopic status message (e.g. "Pair PVCs"), as on the monitor.
 func statusLabel(p *Patient) (string, bool) {
-	if !showAlarms || p.Cfg.CardiacOff {
+	if !showRhythm || p.Cfg.CardiacOff {
 		return "", false
 	}
-	if p.AlarmLvl == 1 && p.AlarmText != "" {
-		return strings.TrimLeft(p.AlarmText, "* "), true
+	s := p.RhythmStatus
+	if p.EctopicStatus != "" {
+		if s != "" {
+			s += "   "
+		}
+		s += p.EctopicStatus
 	}
-	if showRhythm {
-		return rhythmLabel(p), false
-	}
-	return "", false
+	return s, false
 }
 
 // drawNumeric draws a parameter: label and its alarm limits on the left,
@@ -222,21 +173,44 @@ func iconButton(dc uintptr, r RECT, kind int, hot bool) {
 		} else {
 			fill(dc, l+S(2), mid, rr-S(2), b-S(2), rgb(40, 40, 40))
 		}
-	case bSilence: // bell with a slash
-		cx := float64(r.Left) + w/2
-		top := float64(r.Top) + h*0.22
-		bot := float64(r.Top) + h*0.68
-		pts := []POINT{
-			{int32(cx - w*0.24), int32(bot)}, {int32(cx - w*0.17), int32(bot - h*0.08)},
-			{int32(cx - w*0.15), int32(top + h*0.10)}, {int32(cx - w*0.07), int32(top)},
-			{int32(cx + w*0.07), int32(top)}, {int32(cx + w*0.15), int32(top + h*0.10)},
-			{int32(cx + w*0.17), int32(bot - h*0.08)}, {int32(cx + w*0.24), int32(bot)},
-			{int32(cx - w*0.24), int32(bot)},
+	case bSilence: // acknowledge: bell at the upper left, check mark at the lower right
+		bell(dc, float64(r.Left)+w*0.40, float64(r.Top)+h*0.16, w*0.46, h*0.50, dark)
+		ck := pen(rgb(0, 120, 0), int32(math.Max(2, math.Round(2.4*dpiScale))))
+		polyline(dc, []POINT{
+			{r.Left + int32(w*0.52), r.Top + int32(h*0.70)},
+			{r.Left + int32(w*0.63), r.Top + int32(h*0.82)},
+			{r.Left + int32(w*0.86), r.Top + int32(h*0.52)},
+		}, ck)
+	case bAlarms: // pause / switch off alarms: bell with a red X across it
+		if iconPressed { // alarms are off: the key is latched down
+			fill(dc, r.Left+1, r.Top+1, r.Right-1, r.Bottom-1, rgb(150, 150, 150))
 		}
-		polyline(dc, pts, dark)
-		fill(dc, int32(cx-w*0.05), int32(bot+h*0.03), int32(cx+w*0.05), int32(bot+h*0.11), rgb(40, 40, 40))
-		line(dc, r.Left+int32(w*0.22), r.Bottom-int32(h*0.18), r.Right-int32(w*0.22), r.Top+int32(h*0.18), pen(rgb(200, 0, 0), S(2)))
+		bell(dc, float64(r.Left)+w/2, float64(r.Top)+h*0.20, w*0.56, h*0.60, dark)
+		x := pen(rgb(220, 0, 0), int32(math.Max(2, math.Round(2.4*dpiScale))))
+		line(dc, r.Left+int32(w*0.22), r.Top+int32(h*0.22), r.Right-int32(w*0.22), r.Bottom-int32(h*0.20), x)
+		line(dc, r.Right-int32(w*0.22), r.Top+int32(h*0.22), r.Left+int32(w*0.22), r.Bottom-int32(h*0.20), x)
 	}
+}
+
+// isIcon reports whether a hover button is a square icon button.
+func isIcon(k int) bool { return k == bStrip || k == bSilence || k == bExpand || k == bAlarms }
+
+// iconPressed draws the next icon button latched down (alarms off).
+var iconPressed bool
+
+// bell draws an alarm-bell outline centred on cx, from top, w wide and h high
+// (including the clapper).
+func bell(dc uintptr, cx, top, w, h float64, pn uintptr) {
+	bot := top + h*0.80
+	pts := []POINT{
+		{int32(cx - w*0.50), int32(bot)}, {int32(cx - w*0.36), int32(bot - h*0.14)},
+		{int32(cx - w*0.32), int32(top + h*0.22)}, {int32(cx - w*0.14), int32(top)},
+		{int32(cx + w*0.14), int32(top)}, {int32(cx + w*0.32), int32(top + h*0.22)},
+		{int32(cx + w*0.36), int32(bot - h*0.14)}, {int32(cx + w*0.50), int32(bot)},
+		{int32(cx - w*0.50), int32(bot)},
+	}
+	polyline(dc, pts, pn)
+	fill(dc, int32(cx-w*0.10), int32(bot+h*0.05), int32(cx+w*0.10), int32(top+h), rgb(40, 40, 40))
 }
 
 func drawMain(dc uintptr, w, h int32) {
@@ -270,7 +244,7 @@ func drawMain(dc uintptr, w, h int32) {
 
 	// bottom hint bar
 	fill(dc, 0, h-botH, w, h, rgb(34, 34, 34))
-	hint := "  Hover over a patient for options  •  Double-click a patient to silence its alarm  •  Click the lead label to change lead  •  Training simulator - not a medical device"
+	hint := "  Hover over a patient for options  •  Click a wave or number for its settings  •  Double-click a patient to silence its alarm  •  Training simulator - not a medical device"
 	text(dc, hint, 0, h-botH, w, h, rgb(165, 165, 165), font(S(12), false, "Segoe UI"), DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS)
 
 	cols := colsSet
@@ -313,33 +287,77 @@ func drawMain(dc uintptr, w, h int32) {
 }
 
 // alarmBox draws an alarm message box (right-aligned, ending at right).
-func alarmBox(dc uintptr, right, top, bottom, maxW int32, msg string, lvl int, silenced, blink bool, fh int32) {
+// alarmBox draws an alarm message box ending at right and returns its left edge.
+func alarmBox(dc uintptr, right, top, bottom, maxW int32, msg string, lvl int, silenced, blink bool, fh int32) int32 {
 	f := font(fh, true, "Segoe UI")
 	tw := textWidth(dc, msg, f) + S(16)
 	if tw > maxW {
 		tw = maxW
 	}
 	if tw < S(40) {
-		return
+		return right
 	}
 	l := right - tw
 	var bg, fg uint32
 	switch lvl {
 	case 3, AlarmPanic:
-		bg, fg = rgb(225, 0, 0), rgb(255, 255, 255)
-		if lvl == AlarmPanic && !silenced && !blink {
-			bg = rgb(130, 0, 0)
-		}
-	case 2:
+		bg, fg = rgb(225, 0, 0), rgb(255, 255, 255) // steady (no flashing)
+	case 2, 1: // yellow and short-yellow (one-star arrhythmia) alarms
 		bg, fg = rgb(255, 255, 0), rgb(0, 0, 0)
 	case 4:
 		bg, fg = rgb(0, 238, 255), rgb(0, 0, 0)
-	default: // short yellow: text only
-		text(dc, msg, l, top, right-S(6), bottom, rgb(255, 255, 0), f, DT_SINGLELINE|DT_VCENTER|DT_RIGHT|DT_END_ELLIPSIS)
-		return
+	case lvlAlarmsOff: // "Alarms Off" indicator: red text on grey
+		bg, fg = rgb(70, 70, 70), rgb(255, 90, 90)
+	default:
+		return right
 	}
 	roundRect(dc, l, top+S(1), right-S(1), bottom-S(1), S(7), bg, bg) // slightly rounded, as on the monitor
 	text(dc, msg, l+S(6), top, right-S(6), bottom, fg, f, DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS)
+	return l
+}
+
+const lvlAlarmsOff = 99 // alarmBox style for the "Alarms Off" indicator
+
+// drawAlarmArea draws the alarm message box(es) at the top right of a
+// sector: the alarm (if any), and the "Alarms Off" indicator when this
+// patient's alarms are switched off (INOPs are still shown beside it).
+func drawAlarmArea(dc uintptr, p *Patient, right, top, bottom, maxW int32, alarmOn bool, aText string, aLvl int, isSil, blink bool, fh int32) {
+	if p.AlarmsOff {
+		l := alarmBox(dc, right, top, bottom, maxW, "Alarms Off", lvlAlarmsOff, false, false, fh)
+		maxW -= right - l + S(4)
+		right = l - S(4)
+	}
+	lastAlarmRect = RECT{}
+	if alarmOn {
+		msg := aText
+		if isSil {
+			msg = "\u2713 " + msg // acknowledged: frozen until it escalates
+		}
+		l := alarmBox(dc, right, top, bottom, maxW, msg, aLvl, isSil, blink, fh)
+		lastAlarmRect = RECT{l, top, right, bottom}
+	}
+}
+
+// lastAlarmRect is where the last alarm message box was drawn.
+var lastAlarmRect RECT
+
+// toggleAlarms switches a patient's alarms off or back on.
+func toggleAlarms(bed int) {
+	p := patients[bed]
+	p.AlarmsOff = !p.AlarmsOff
+	acks[bed] = ackState{}
+	if p.AlarmsOff {
+		p.LogEvent("Alarms Off", 4)
+	} else {
+		p.LogEvent("Alarms On", 4)
+	}
+	if !p.AlarmsOff {
+		p.resetTimeouts() // switching alarms off and on resets the timeout periods
+	}
+	p.latch = nil
+	p.computeHR(now())
+	forceSound = true
+	updateAlarmState()
 }
 
 func drawSector(dc uintptr, bed int, rc RECT, t float64) {
@@ -348,10 +366,15 @@ func drawSector(dc uintptr, bed int, rc RECT, t float64) {
 	sw, sh := float64(in.Right-in.Left), float64(in.Bottom-in.Top)
 	idx := len(sectors) // this sector's index once appended
 	hovered := hoverSec == idx
+	curHits = nil
 
 	alarmOn := showAlarms && !standby[bed] && p.AlarmText != ""
-	isSil := alarmOn && silenced[bed] != ""
-	newAlarm := alarmOn && !isSil && p.AlarmLvl != 1
+	aText, aLvl, isSil := shownAlarm(bed)
+	alarmOn = alarmOn || (showAlarms && isSil)
+	isSil = alarmOn && isSil
+	// INOPs (technical) don't turn the sector blue; a latched short-yellow
+	// arrhythmia message only does while its condition is present
+	newAlarm := alarmOn && !isSil && p.AlarmLvl != 4 && (p.AlarmLvl != 1 || p.AlarmFresh)
 	blink := int(t*4)%2 == 0
 
 	bg := rgb(0, 0, 0)
@@ -378,7 +401,7 @@ func drawSector(dc uintptr, bed int, rc RECT, t float64) {
 	spo2On := p.Cfg.SpO2On != SpO2Off
 	respOn := !p.Cfg.RespRateOff
 	respWave := p.Cfg.RespWaveShown()
-	pulseNum := spo2On && (!ecgOn || p.Cfg.Rhythm == RLeadsOff)
+	pulseNum := spo2On && (!ecgOn || p.LeadsOff())
 
 	type slot struct {
 		kind int // kHR / kSpO2 / kRR / kPulse / kABP / kNBP / kCO2 (waves: ECG=kHR, Pleth=kSpO2, Resp=kRR)
@@ -452,6 +475,7 @@ func drawSector(dc uintptr, bed int, rc RECT, t float64) {
 	for i, w := range waves {
 		r := wr[i]
 		tr := RECT{r.Left + labW, r.Top, r.Right, r.Bottom} // trace area
+		curHits = append(curHits, mhit{tr, measOfKind(w.kind)})
 		switch w.kind {
 		case 0:
 			lead := p.Cfg.LeadName()
@@ -567,29 +591,18 @@ func drawSector(dc uintptr, bed int, rc RECT, t float64) {
 
 	// header (drawn over the top of the waves, as on the real screen)
 	drawHeader(dc, bed, in, l1, l2, fh, false)
-	if alarmOn && p.AlarmLvl != 1 { // short-yellow messages (Irregular HR) sit on the ECG instead
-		msg := p.AlarmText
-		if isSil {
-			msg = "✓ " + msg // acknowledged
-		}
-		alarmBox(dc, in.Right, in.Top, in.Top+l1, int32(sw*0.62), msg, p.AlarmLvl, isSil, blink, fh)
-	}
+	drawAlarmArea(dc, p, in.Right, in.Top, in.Top+l1, int32(sw*0.62), alarmOn, aText, aLvl, isSil, blink, fh)
+	geom.alarm = lastAlarmRect
 
 	// hover buttons
 	if hovered {
+		// as at the Information Center: strip, Manage Patient, Review,
+		// Measurements, and the expand button
 		var specs []int
 		if ecgOn {
 			specs = append(specs, bStrip)
 		}
-		specs = append(specs, bRhythm)
-		if ecgOn {
-			specs = append(specs, bTune)
-		}
-		specs = append(specs, bLimits)
-		if alarmOn && !isSil {
-			specs = append(specs, bSilence)
-		}
-		specs = append(specs, bExpand)
+		specs = append(specs, bRhythm, bReview, bMeas, bExpand)
 		expandedNow = expandedBed == bed
 		geom.btns = layoutButtons(dc, in, specs, p, idx)
 	}
@@ -598,7 +611,15 @@ func drawSector(dc uintptr, bed int, rc RECT, t float64) {
 
 func drawHeader(dc uintptr, bed int, in RECT, l1, l2, fh int32, isStandby bool) {
 	p := patients[bed]
-	text(dc, strings.ToUpper(bedLabel(bed)), in.Left+S(4), in.Top, in.Left+S(120), in.Top+l1, cWhite, font(fh, true, "Segoe UI"), DT_SINGLELINE|DT_VCENTER)
+	bl := strings.ToUpper(bedLabel(bed))
+	bf := font(fh, true, "Segoe UI")
+	text(dc, bl, in.Left+S(4), in.Top, in.Left+S(120), in.Top+l1, cWhite, bf, DT_SINGLELINE|DT_VCENTER)
+	if p.AlarmsOff && !isStandby { // alarms off: crossed symbol beside the bed label
+		cx, cy, d := in.Left+S(4)+textWidth(dc, bl, bf)+S(18), in.Top+l1/2, l1*3/10
+		pn := pen(cWhite, int32(math.Max(2, math.Round(2.2*dpiScale))))
+		line(dc, cx-d, cy-d, cx+d, cy+d, pn)
+		line(dc, cx+d, cy-d, cx-d, cy+d, pn)
+	}
 	name := displayName(p)
 	nameW := int32(float64(in.Right-in.Left) * 0.45)
 	text(dc, name, in.Left+S(4), in.Top+l1, in.Left+S(4)+nameW, in.Top+l1+l2, cWhite, font(int32(float64(fh)*0.95), true, "Segoe UI"), DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS)
@@ -619,10 +640,10 @@ func layoutButtons(dc uintptr, in RECT, specs []int, p *Patient, sec int) []hbtn
 	sw, sh := float64(in.Right-in.Left), float64(in.Bottom-in.Top)
 	bh := int32(clamp(sh*0.18, float64(S(20)), float64(S(34))))
 	gap := S(10)
-	textW := int32(clamp(sw*0.17, float64(S(70)), float64(S(122))))
+	textW := int32(clamp(sw*0.21, float64(S(70)), float64(S(150))))
 	total := int32(0)
 	for _, k := range specs {
-		if k == bStrip || k == bSilence || k == bExpand {
+		if isIcon(k) {
 			total += bh
 		} else {
 			total += textW
@@ -634,7 +655,7 @@ func layoutButtons(dc uintptr, in RECT, specs []int, p *Patient, sec int) []hbtn
 		over := total - avail
 		ntext := int32(0)
 		for _, k := range specs {
-			if k != bStrip && k != bSilence && k != bExpand {
+			if !isIcon(k) {
 				ntext++
 			}
 		}
@@ -646,7 +667,7 @@ func layoutButtons(dc uintptr, in RECT, specs []int, p *Patient, sec int) []hbtn
 		}
 		total = 0
 		for _, k := range specs {
-			if k == bStrip || k == bSilence || k == bExpand {
+			if isIcon(k) {
 				total += bh
 			} else {
 				total += textW
@@ -667,16 +688,21 @@ func layoutButtons(dc uintptr, in RECT, specs []int, p *Patient, sec int) []hbtn
 	var out []hbtn
 	for _, k := range specs {
 		w := textW
-		if k == bStrip || k == bSilence || k == bExpand {
+		if isIcon(k) {
 			w = bh
 		}
 		r := RECT{x, y, x + w, y + bh}
 		hot := hoverBtnSec == sec && hoverBtnKind == k
 		switch k {
-		case bStrip, bSilence, bExpand:
+		case bStrip, bSilence, bExpand, bAlarms:
+			iconPressed = k == bAlarms && p.AlarmsOff
 			iconButton(dc, r, k, hot)
 		case bRhythm:
-			flatButton(dc, r, fit("Adjust Rhythm", "Rhythm"), hot, fh)
+			flatButton(dc, r, fit("Manage Patient", "Patient"), hot, fh)
+		case bReview:
+			flatButton(dc, r, "Review", hot, fh)
+		case bMeas:
+			flatButton(dc, r, fit("Measurements", "Meas."), hot, fh)
 		case bTune:
 			flatButton(dc, r, fit("Fine Tune", "Tune"), hot, fh)
 			if p.Cfg.Tune.UserSet {
@@ -711,6 +737,7 @@ func finishSector(dc uintptr, rc RECT, hovered bool, geom sectorGeom) {
 		fill(dc, rc.Left+1, rc.Top+1, rc.Left+1+b, rc.Bottom, cHoverBdr)
 		fill(dc, rc.Right-b, rc.Top+1, rc.Right, rc.Bottom, cHoverBdr)
 	}
+	geom.hits, curHits = curHits, nil
 	sectors = append(sectors, geom)
 }
 
@@ -785,6 +812,12 @@ func handleSectorClick(hwnd uintptr, x, y int32) bool {
 				openLimits(s.bed)
 			case bSilence:
 				silenceBed(s.bed)
+			case bAlarms:
+				toggleAlarms(s.bed)
+			case bReview:
+				openReview(s.bed)
+			case bMeas:
+				chooseMeas(hwnd, s.bed, b.rc)
 			case bExpand:
 				if expandedBed == s.bed {
 					expandedBed = -1
@@ -801,6 +834,13 @@ func handleSectorClick(hwnd uintptr, x, y int32) bool {
 		if s.nbp.contains(x, y) {
 			chooseNBP(hwnd, s.bed, s.nbp)
 			return true
+		}
+		for _, h := range s.hits { // a wave or numeric: its setup window
+			if h.rc.contains(x, y) && !standby[s.bed] {
+				pendingClick.on, pendingClick.bed, pendingClick.meas = true, s.bed, h.meas
+				pendingClick.x, pendingClick.y, pendingClick.at = x, y, now()
+				return true
+			}
 		}
 	}
 	return false

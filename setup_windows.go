@@ -24,35 +24,39 @@ func syscallCallback(f func(hwnd, msg, wp, lp uintptr) uintptr) uintptr {
 }
 
 const (
-	ctlName     = 10
-	ctlRhythm   = 11
-	ctlRate     = 12
-	ctlEctopy   = 13
-	ctlPattern  = 14
-	ctlFreq     = 15
-	ctlApply    = 3
-	ctlStandby  = 16
-	ctlRatio    = 17
-	ctlSpO2     = 18
-	ctlSpO2Val  = 19
-	ctlPace     = 20
-	ctlIntr     = 21
-	ctlArt      = 22
-	ctlArtLvl   = 23
-	ctlResp     = 24
-	ctlRR       = 25
-	ctlCardiac  = 26
-	ctlRespWave = 27
-	ctlNBPMode  = 30
-	ctlNBPInt   = 31
-	ctlNBPSys   = 32
-	ctlNBPDia   = 33
-	ctlNBPNow   = 34
-	ctlABP      = 35
-	ctlABPSys   = 36
-	ctlABPDia   = 37
-	ctlCO2      = 38
-	ctlEtCO2    = 39
+	ctlName      = 10
+	ctlRhythm    = 11
+	ctlRate      = 12
+	ctlEctopy    = 13
+	ctlPattern   = 14
+	ctlFreq      = 15
+	ctlApply     = 3
+	ctlStandby   = 16
+	ctlRatio     = 17
+	ctlSpO2      = 18
+	ctlSpO2Val   = 19
+	ctlPace      = 20
+	ctlIntr      = 21
+	ctlArt       = 22
+	ctlArtLvl    = 23
+	ctlResp      = 24
+	ctlRR        = 25
+	ctlCardiac   = 26
+	ctlRespWave  = 27
+	ctlPulseless = 28
+	ctlBBB       = 29
+	ctlLeadsEp   = 45
+	ctlAlarmsOff = 46
+	ctlNBPMode   = 30
+	ctlNBPInt    = 31
+	ctlNBPSys    = 32
+	ctlNBPDia    = 33
+	ctlNBPNow    = 34
+	ctlABP       = 35
+	ctlABPSys    = 36
+	ctlABPDia    = 37
+	ctlCO2       = 38
+	ctlEtCO2     = 39
 )
 
 var (
@@ -63,6 +67,9 @@ var (
 	hStandby, hRatio, hRateLabel                 uintptr
 	hSpO2, hSpO2Val                              uintptr
 	hPace, hIntr, hRow3Label, hIntrLabel         uintptr
+	hPulseless, hBBB, hIntrNote, hLeadsEp        uintptr
+	hFreqUnit, hAlarmsOffBox                     uintptr
+	ctlHidden                                    bool // create the next controls hidden
 	ctlParent                                    uintptr
 	hArt, hArtLvl                                uintptr
 	hResp, hRR, hCardiac, hRespWave              uintptr
@@ -78,7 +85,7 @@ func openSetup(bed int) {
 	}
 	setupBed = bed
 	uiFont = font(S(15), false, "Segoe UI")
-	w, h := S(850), S(598)
+	w, h := S(480), S(604)
 	var mr RECT
 	call(pGetWindowRect, mainHwnd, uintptr(unsafe.Pointer(&mr)))
 	x := mr.Left + (mr.Right-mr.Left-w)/2
@@ -121,12 +128,18 @@ func openSetup(bed int) {
 	for _, s := range PaceModeNames {
 		call(pSendMessageW, hPace, CB_ADDSTRING, 0, uintptr(unsafe.Pointer(wstr(s))))
 	}
+	hPulseless = ctl("BUTTON", "Pulseless V-tach (no cardiac output)", WS_TABSTOP|BS_AUTOCHECKBOX, cx, row(3), S(290), S(26), ctlPulseless)
 	// row 4: intrinsic rate under a demand pacemaker
 	hIntrLabel = label("Intrinsic rate (bpm):", 4)
 	hIntr = ctl("EDIT", "", WS_TABSTOP|ES_NUMBER, cx, row(4), S(70), S(26), ctlIntr)
-	ctl("STATIC", "patient's own rate (drifts +/-10%)", 0, cx+S(80), row(4)+S(3), S(220), S(22), 0)
+	hIntrNote = ctl("STATIC", "patient's own rate (drifts +/-10%)", 0, cx+S(80), row(4)+S(3), S(220), S(22), 0)
+	// row 4 (non-paced rhythms): intraventricular conduction / bundle branch block
+	hBBB = ctl("COMBOBOX", "", WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL, cx, row(4), S(270), S(160), ctlBBB)
+	for _, n := range ConductionNames {
+		call(pSendMessageW, hBBB, CB_ADDSTRING, 0, uintptr(unsafe.Pointer(wstr(n))))
+	}
 
-	label("Ectopic beats:", 5)
+	label("Ectopy / events:", 5)
 	hEctopy = ctl("COMBOBOX", "", WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL, cx, row(5), S(270), S(220), ctlEctopy)
 	for _, s := range EctopyNames {
 		call(pSendMessageW, hEctopy, CB_ADDSTRING, 0, uintptr(unsafe.Pointer(wstr(s))))
@@ -140,8 +153,11 @@ func openSetup(bed int) {
 
 	hFreqLabel = label("Ectopy frequency:", 7)
 	hFreq = ctl("EDIT", "", WS_TABSTOP|ES_NUMBER, cx, row(7), S(70), S(26), ctlFreq)
-	ctl("STATIC", "per minute", 0, cx+S(80), row(7)+S(3), S(190), S(22), 0)
+	hFreqUnit = ctl("STATIC", "per minute", 0, cx+S(80), row(7)+S(3), S(190), S(22), 0)
 
+	// Measurement settings now live in the measurement setup windows; their
+	// controls are kept (hidden) so this dialog preserves those values.
+	ctlHidden = true
 	label("SpO2:", 8)
 	hSpO2 = ctl("COMBOBOX", "", WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL, cx, row(8), S(160), S(160), ctlSpO2)
 	for _, m := range SpO2ModeNames {
@@ -167,9 +183,10 @@ func openSetup(bed int) {
 	hRespWave = ctl("BUTTON", "Wave", WS_TABSTOP|BS_AUTOCHECKBOX, cx+S(212), row(10), S(60), S(26), ctlRespWave)
 
 	hCardiac = ctl("BUTTON", "Cardiac (ECG) monitoring", WS_TABSTOP|BS_AUTOCHECKBOX, lx, row(11), S(220), S(26), ctlCardiac)
+	ctlHidden = false
 	hStandby = ctl("BUTTON", "Standby (monitoring paused)", WS_TABSTOP|BS_AUTOCHECKBOX, lx+S(230), row(11), S(220), S(26), ctlStandby)
-
 	hNote = ctl("STATIC", "", 0, lx, row(12)+S(2), S(430), S(40), 0)
+	ctlHidden = true
 
 	// ---- right column: blood pressure and capnography ----
 	rx, rcx := S(480), S(610)
@@ -205,7 +222,17 @@ func openSetup(bed int) {
 	hEtCO2 = ctl("EDIT", "", WS_TABSTOP|ES_NUMBER, rcx, row(9), S(48), S(26), ctlEtCO2)
 	ctl("STATIC", "mmHg  (breaths follow the resp rate)", 0, rcx+S(54), row(9)+S(3), S(190), S(22), 0)
 
-	by := row(13) + S(8)
+	ctlHidden = false
+	hLeadsEp = ctl("BUTTON", "Electrodes come off now and then (Leads Off ~10 s - 4 min)", WS_TABSTOP|BS_AUTOCHECKBOX, lx, row(8), S(440), S(26), ctlLeadsEp)
+	hAlarmsOffBox = ctl("BUTTON", "Alarms Off (all alarms for this patient)", WS_TABSTOP|BS_AUTOCHECKBOX, lx, row(9), S(300), S(26), ctlAlarmsOff)
+	if patients[bed].AlarmsOff {
+		call(pSendMessageW, hAlarmsOffBox, BM_SETCHECK, 1, 0)
+	}
+	call(pSetWindowPos, hStandby, 0, uintptr(lx), uintptr(row(10)), 0, 0, 0x0001|0x0004) // SWP_NOSIZE|SWP_NOZORDER
+	call(pSetWindowPos, hNote, 0, uintptr(lx), uintptr(row(11)+S(2)), 0, 0, 0x0001|0x0004)
+	ctl("STATIC", "ECG lead, artifact, SpO\u2082, Resp, NBP, ABP, CO\u2082 and alarm limits: click the wave or numeric, or use Measurements.",
+		0, lx, row(12)+S(4), S(440), S(40), 0)
+	by := row(13) + S(14)
 	okText := "OK"
 	if activating {
 		okText = "Activate"
@@ -221,6 +248,13 @@ func openSetup(bed int) {
 	call(pSendMessageW, hRatio, CB_SETCURSEL, uintptr(c.FlRatio), 0)
 	call(pSendMessageW, hPace, CB_SETCURSEL, uintptr(c.PaceMode), 0)
 	call(pSendMessageW, hArt, CB_SETCURSEL, uintptr(c.Artifact), 0)
+	if c.Pulseless {
+		call(pSendMessageW, hPulseless, BM_SETCHECK, 1, 0)
+	}
+	call(pSendMessageW, hBBB, CB_SETCURSEL, uintptr(c.Conduction), 0)
+	if c.LeadsOffEp {
+		call(pSendMessageW, hLeadsEp, BM_SETCHECK, 1, 0)
+	}
 	if !c.RespRateOff {
 		call(pSendMessageW, hResp, BM_SETCHECK, 1, 0)
 	}
@@ -301,7 +335,11 @@ func ctl(class, txt string, style uint32, x, y, w, h int32, id int) uintptr {
 	if class == "EDIT" {
 		ex = WS_EX_CLIENTEDGE
 	}
-	hw := call(pCreateWindowExW, ex, uintptr(unsafe.Pointer(wstr(class))), uintptr(unsafe.Pointer(wstr(txt))), uintptr(WS_CHILD|WS_VISIBLE|style),
+	vis := uint32(WS_VISIBLE)
+	if ctlHidden {
+		vis = 0
+	}
+	hw := call(pCreateWindowExW, ex, uintptr(unsafe.Pointer(wstr(class))), uintptr(unsafe.Pointer(wstr(txt))), uintptr(WS_CHILD|vis|style),
 		uintptr(x), uintptr(y), uintptr(w), uintptr(h), ctlParent, uintptr(id), hInst, 0)
 	call(pSendMessageW, hw, WM_SETFONT, uiFont, 1)
 	return hw
@@ -348,6 +386,7 @@ func refreshSetup() {
 	enable(hABPSys, abpOn)
 	enable(hABPDia, abpOn)
 	enable(hEtCO2, call(pSendMessageW, hCO2, BM_GETCHECK, 0, 0) == 1)
+	enable(hLeadsEp, r != RLeadsOff && cardiacOn)
 	paced := IsPaced(r)
 	show := func(h uintptr, on bool) {
 		v := uintptr(0)
@@ -356,16 +395,29 @@ func refreshSetup() {
 		}
 		call(pShowWindow, h, v)
 	}
-	show(hRatio, !paced)
+	vt := r == RVTach
+	show(hRatio, !paced && !vt)
 	show(hPace, paced)
+	show(hPulseless, vt)
 	if paced {
 		call(pSetWindowTextW, hRow3Label, uintptr(unsafe.Pointer(wstr("Pacing mode:"))))
+	} else if vt {
+		call(pSetWindowTextW, hRow3Label, uintptr(unsafe.Pointer(wstr("Pulse:"))))
 	} else {
 		call(pSetWindowTextW, hRow3Label, uintptr(unsafe.Pointer(wstr("Flutter conduction:"))))
 	}
 	demand := paced && cbSel(hPace) == PaceDemand
+	show(hIntr, paced)
+	show(hIntrNote, paced)
+	show(hBBB, !paced)
 	enable(hIntr, demand)
-	enable(hIntrLabel, demand)
+	enable(hIntrLabel, demand || (!paced && UsesConduction(r)))
+	enable(hBBB, UsesConduction(r))
+	if paced {
+		call(pSetWindowTextW, hIntrLabel, uintptr(unsafe.Pointer(wstr("Intrinsic rate (bpm):"))))
+	} else {
+		call(pSetWindowTextW, hIntrLabel, uintptr(unsafe.Pointer(wstr("Conduction:"))))
+	}
 	enable(hSpO2Val, cbSel(hSpO2) == SpO2Monitored)
 	if r == RAflutter && ratio != FlAuto {
 		call(pSetWindowTextW, hRateLabel, uintptr(unsafe.Pointer(wstr("Flutter wave rate (/min):"))))
@@ -387,15 +439,31 @@ func refreshSetup() {
 	enable(hEctopy, info.Ectopy)
 	ect := cbSel(hEctopy)
 	on := info.Ectopy && ect != EctNone
-	enable(hPattern, on)
-	enable(hFreq, on && PatternUsesFreq(cbSel(hPattern)))
+	sinusEv := ect == EctPSVT || ect == EctSinusPause
+	enable(hPattern, on && !sinusEv)
+	enable(hFreq, on && (sinusEv || PatternUsesFreq(cbSel(hPattern))))
+	unit := "per minute"
+	if EctopyPerHour(ect) {
+		unit = "episodes per hour"
+	}
+	call(pSetWindowTextW, hFreqUnit, uintptr(unsafe.Pointer(wstr(unit))))
 
 	note := ""
 	switch {
+	case r == RVTach && call(pSendMessageW, hPulseless, BM_GETCHECK, 0, 0) == 1:
+		note = "Pulseless: no pleth, arterial pressure falls away and NBP fails."
 	case !info.Ectopy:
 		note = "Ectopic beats are not used with this rhythm."
 	case (ect == EctPAC || ect == EctPJC) && !info.AtrialEctopy:
 		note = "PACs/PJCs don't apply to this rhythm - choose PVCs instead."
+	case sinusEv && !SinusNode(r):
+		note = "PSVT and sinus pauses need a sinus rhythm (sinus, sinus arrhythmia, 1st degree)."
+	case ect == EctPSVT:
+		note = "PSVT: sudden runs of SVT (150-220/min, 8-60 s) started by a PAC, ending abruptly."
+	case ect == EctSinusPause:
+		note = "Sinus pauses: no P wave for 1.6-3.6 s (over 2 s alarms * Pause)."
+	case on && cbSel(hPattern) == PatVTRuns:
+		note = "Runs of 4-12 PVCs at ~180/min: 5 or more alarm *** VTach, shorter * Non-Sustain VT."
 	case on && PatternUsesFreq(cbSel(hPattern)):
 		note = "Frequency = ectopic events per minute (pairs or runs count as one event)."
 	case on:
@@ -481,6 +549,9 @@ func applySetup() {
 		Name:        getText(hName),
 		Rhythm:      r,
 		Rate:        rate,
+		Pulseless:   r == RVTach && call(pSendMessageW, hPulseless, BM_GETCHECK, 0, 0) == 1,
+		Conduction:  cbSel(hBBB),
+		LeadsOffEp:  r != RLeadsOff && call(pSendMessageW, hLeadsEp, BM_GETCHECK, 0, 0) == 1,
 		Ectopy:      cbSel(hEctopy),
 		Pattern:     cbSel(hPattern),
 		Freq:        freq,
@@ -513,6 +584,9 @@ func applySetup() {
 		cfg.Ectopy = EctNone
 	}
 	patients[setupBed].Apply(cfg, now())
+	if off := call(pSendMessageW, hAlarmsOffBox, BM_GETCHECK, 0, 0) == 1; off != patients[setupBed].AlarmsOff {
+		toggleAlarms(setupBed)
+	}
 	standby[setupBed] = call(pSendMessageW, hStandby, BM_GETCHECK, 0, 0) == 1
 }
 
@@ -561,7 +635,7 @@ func setupProc(hwnd, msg, wp, lp uintptr) uintptr {
 				call(pSetWindowTextW, hRate, uintptr(unsafe.Pointer(wstr(strconv.Itoa(def)))))
 				refreshSetup()
 			}
-		case ctlResp, ctlRespWave, ctlCardiac, ctlABP, ctlCO2:
+		case ctlResp, ctlRespWave, ctlCardiac, ctlABP, ctlCO2, ctlPulseless:
 			refreshSetup()
 		case ctlNBPMode, ctlNBPInt:
 			if code == CBN_SELCHANGE {
@@ -570,7 +644,7 @@ func setupProc(hwnd, msg, wp, lp uintptr) uintptr {
 		case ctlNBPNow:
 			applySetup()
 			patients[setupBed].StartNBP(now())
-		case ctlEctopy, ctlPattern, ctlSpO2, ctlPace, ctlArt:
+		case ctlEctopy, ctlPattern, ctlSpO2, ctlPace, ctlArt, ctlBBB:
 			if code == CBN_SELCHANGE {
 				refreshSetup()
 			}
